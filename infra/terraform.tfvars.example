@@ -1,0 +1,4 @@
+project_id  = "testing-444715"
+region      = "me-central2"
+bucket_name = "meter-data-lake-testing-444715"
+dataset_id  = "raw_meter_readings"

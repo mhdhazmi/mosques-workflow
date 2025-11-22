@@ -1,0 +1,10 @@
+version: 2
+
+sources:
+  - name: raw_meter_readings
+    description: "Raw meter readings loaded from GCS"
+    database: "testing-444715" # Replace with your actual Project ID if not using the default from profile
+    schema: raw_meter_readings # The BigQuery Dataset ID
+    tables:
+      - name: smart_meters_clean
+        description: "Cleaned smart meter data with quarter information"

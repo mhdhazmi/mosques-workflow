@@ -1,0 +1,12 @@
+default:
+  target: dev
+  outputs:
+    dev:
+      type: bigquery
+      method: oauth
+      project: testing-444715
+      dataset: raw_meter_readings
+      location: me-central2
+      threads: 1
+      priority: interactive
+      quota_project_id: testing-444715

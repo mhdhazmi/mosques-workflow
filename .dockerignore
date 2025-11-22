@@ -1,8 +1,37 @@
-astro
-.git
-.env
+# --- Global ---
+.DS_Store
+.git/
+.gitignore
+.dockerignore
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# --- Airflow / Astro ---
+.astro/
 airflow_settings.yaml
-logs/
-.venv
-airflow.db
 airflow.cfg
+airflow.db
+logs/
+tmp/
+
+# --- Secrets ---
+.env
+include/gcp_adc.json
+infra/*.tfvars
+infra/.terraform/
+infra/*.tfstate*
+
+# --- Data ---
+data/
+include/raw_data/
+include/processed_data/
+
+# --- dbt ---
+dags/dbt/target/
+dags/dbt/dbt_packages/
+dags/dbt/logs/

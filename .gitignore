@@ -1,13 +1,48 @@
-.git
-.env
+# --- Global ---
 .DS_Store
-airflow_settings.yaml
+.vscode/
+.idea/
+*.log
+
+# --- Python ---
 __pycache__/
-astro
-.venv
-airflow-webserver.pid
-webserver_config.py
+*.py[cod]
+.venv/
+venv/
+env/
+
+# --- Airflow / Astro ---
+.astro/
+airflow_settings.yaml
 airflow.cfg
 airflow.db
-include/*
-.astro/*
+airflow-webserver.pid
+webserver_config.py
+logs/
+tmp/
+
+# --- Secrets ---
+.env
+include/gcp_adc.json
+google_credentials.json
+gcp_adc.json
+
+# --- Data (CRITICAL: Do not commit data) ---
+data/
+include/raw_data/
+include/processed_data/
+include/downloads/
+
+# --- dbt ---
+dags/dbt/target/
+dags/dbt/dbt_packages/
+dags/dbt/logs/
+dags/dbt/dbt_modules/
+
+# --- Terraform ---
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars
+!terraform.tfvars.example
+.terraform.lock.hcl

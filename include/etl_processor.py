@@ -187,7 +187,9 @@ def process_file_streaming(input_path, output_dir, col_mapping):
             pl.col("EXPORT_ACTIVE_POWER").str.strip_chars().cast(pl.Float64),
             pl.col("IMPORT_REACTIVE_POWER").str.strip_chars().cast(pl.Float64),
             pl.col("EXPORT_REACTIVE_POWER").str.strip_chars().cast(pl.Float64),
-            (pl.concat_str([pl.col("METER_ID"), pl.col("DATA_TIME"), pl.col("IMPORT_ACTIVE_POWER")]).hash()).alias("ROW_HASH")
+            # Fix: Cast hash to Int64 because BigQuery INTEGER is signed 64-bit.
+            # Polars hash() is UInt64. We use modulo 2^63-1 to ensure it fits in positive Int64.
+            (pl.concat_str([pl.col("METER_ID"), pl.col("DATA_TIME"), pl.col("IMPORT_ACTIVE_POWER")]).hash() % (2**63 - 1)).cast(pl.Int64).alias("ROW_HASH")
         ])
 
         # 5. Sink to Parquet (The Magic Step)

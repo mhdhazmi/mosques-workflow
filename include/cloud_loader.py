@@ -69,10 +69,12 @@ def load_gcs_to_bigquery(uri, dataset_id, table_id):
         temp_table_id = f"{PROJECT_ID}.{dataset_id}.temp_{int(time.time())}"
         
         # 1. Load to Temp Table
+        # 1. Load to Temp Table
         job_config = bigquery.LoadJobConfig(
             source_format=bigquery.SourceFormat.PARQUET,
             write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
-            schema_update_options=[bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION],
+            # schema_update_options removed as it conflicts with WRITE_TRUNCATE in some contexts
+            # and is not needed for a fresh temp table.
         )
 
         load_job = bq_client.load_table_from_uri(
@@ -110,6 +112,7 @@ def load_gcs_to_bigquery(uri, dataset_id, table_id):
         return False
 
 if __name__ == "__main__":
+    print("DEBUG: Starting cloud_loader.py...")
     # Check if local directory exists
     if not os.path.exists(LOCAL_OUTPUT_DIR):
         logger.error(f"Local directory {LOCAL_OUTPUT_DIR} not found. Run etl_processor.py first.")

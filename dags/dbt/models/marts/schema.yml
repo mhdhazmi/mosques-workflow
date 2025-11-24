@@ -1,0 +1,22 @@
+version: 2
+
+models:
+  - name: consumption_stats
+    description: "Daily aggregated consumption statistics per meter"
+    columns:
+      - name: METER_ID
+        description: "Unique identifier for the smart meter"
+        tests:
+          - not_null
+      - name: date
+        description: "Date of the readings"
+        tests:
+          - not_null
+      - name: avg_daily_power_watts
+        description: "Average active power import for the day"
+      - name: readings_count
+        description: "Number of readings aggregated for this day"
+
+    tests:
+      - unique:
+          column_name: "(METER_ID || '-' || date)" # Composite uniqueness check

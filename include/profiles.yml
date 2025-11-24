@@ -9,4 +9,3 @@ default:
       location: me-central2
       threads: 1
       priority: interactive
-      quota_project_id: testing-444715

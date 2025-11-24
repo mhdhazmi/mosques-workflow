@@ -43,9 +43,12 @@ with DAG(
         ),
         env={
             "GOOGLE_API_KEY": os.environ.get("GOOGLE_API_KEY", ""),
-            "ETL_LOW_MEMORY_MODE": os.environ.get("ETL_LOW_MEMORY_MODE", "true"),
-            "ETL_ROW_GROUP_SIZE": os.environ.get("ETL_ROW_GROUP_SIZE", "50000"),
+            "ETL_LOW_MEMORY_MODE": os.environ.get("ETL_LOW_MEMORY_MODE", "false"),
+            "ETL_ROW_GROUP_SIZE": os.environ.get("ETL_ROW_GROUP_SIZE", "250000"),
             "AIRFLOW_HOME": os.environ.get("AIRFLOW_HOME", "/usr/local/airflow"),
+            "PARQUET_COMPRESSION": os.environ.get("PARQUET_COMPRESSION", "snappy"),
+            "ETL_ENABLE_ROW_HASH": os.environ.get("ETL_ENABLE_ROW_HASH", "false"),   
+
         },
     )
 

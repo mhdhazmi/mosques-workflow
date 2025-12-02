@@ -46,3 +46,9 @@ dags/dbt/dbt_modules/
 *.tfvars
 !terraform.tfvars.example
 .terraform.lock.hcl
+
+
+52. *
+include/utils_data/*
+issues.md
+mosq_functions.py

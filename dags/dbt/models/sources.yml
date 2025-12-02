@@ -7,15 +7,15 @@ sources:
     schema: raw_meter_readings # The BigQuery Dataset ID
     tables:
       - name: smart_meters_clean
-        description: "Cleaned smart meter data with quarter information"
-        columns:
-          - name: METER_ID
-            tests:
-              - not_null
-          - name: DATA_TIME
-            tests:
-              - not_null
-          - name: ROW_HASH
-            tests:
-              - unique
-              - not_null
+        description: "Cleaned smart meter readings with deduplication and type casting."
+        tests:
+          - unique:
+              column_name: ROW_HASH
+          - not_null:
+              column_name: ROW_HASH
+          - not_null:
+              column_name: METER_ID
+          - not_null:
+              column_name: DATA_TIME
+
+

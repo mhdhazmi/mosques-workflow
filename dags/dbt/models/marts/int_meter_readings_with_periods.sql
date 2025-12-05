@@ -21,6 +21,7 @@ joined as (
         r.active_power_watts,
         r.reading_date,
         r.reading_time,
+        r.quarter,
 
         p.fajr_time,
         p.dhuhr_time,

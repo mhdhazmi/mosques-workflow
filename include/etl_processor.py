@@ -281,12 +281,13 @@ def build_lazy_pipeline(
     q = q.with_columns(derived_cols)
 
     # 5. Ensure numeric types for power columns
+    # Strip whitespace first, then cast to Float64
     q = q.with_columns(
         [
-            pl.col("IMPORT_ACTIVE_POWER").cast(pl.Float64, strict=False),
-            pl.col("EXPORT_ACTIVE_POWER").cast(pl.Float64, strict=False),
-            pl.col("IMPORT_REACTIVE_POWER").cast(pl.Float64, strict=False),
-            pl.col("EXPORT_REACTIVE_POWER").cast(pl.Float64, strict=False),
+            pl.col("IMPORT_ACTIVE_POWER").cast(pl.Utf8).str.strip_chars().cast(pl.Float64, strict=False),
+            pl.col("EXPORT_ACTIVE_POWER").cast(pl.Utf8).str.strip_chars().cast(pl.Float64, strict=False),
+            pl.col("IMPORT_REACTIVE_POWER").cast(pl.Utf8).str.strip_chars().cast(pl.Float64, strict=False),
+            pl.col("EXPORT_REACTIVE_POWER").cast(pl.Utf8).str.strip_chars().cast(pl.Float64, strict=False),
         ]
     )
 

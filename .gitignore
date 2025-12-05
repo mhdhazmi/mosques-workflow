@@ -52,3 +52,4 @@ dags/dbt/dbt_modules/
 include/utils_data/*
 issues.md
 mosq_functions.py
+docs/

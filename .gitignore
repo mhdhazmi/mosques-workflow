@@ -53,3 +53,4 @@ include/utils_data/*
 issues.md
 mosq_functions.py
 docs/
+.cursor/*

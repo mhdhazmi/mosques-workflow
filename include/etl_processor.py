@@ -352,6 +352,24 @@ def process_file_streaming(input_path: str, output_dir: str, col_mapping: dict) 
         t_sink_end = time.perf_counter()
         logger.info(f"sink_parquet execution took {t_sink_end - t_sink_start:.2f} seconds")
 
+        # 3. CRITICAL: Validate that data was actually written (prevent silent data loss)
+        if not os.path.exists(output_path):
+            raise RuntimeError(f"Parquet file was not created at {output_path}")
+
+        # Read parquet metadata to verify row count without loading data into memory
+        parquet_metadata = pl.scan_parquet(output_path)
+        row_count = parquet_metadata.select(pl.len()).collect().item()
+
+        if row_count == 0:
+            # Remove the empty file to avoid downstream confusion
+            os.remove(output_path)
+            raise RuntimeError(
+                f"CRITICAL: Zero rows written to {output_path}. "
+                f"Input file: {input_path}. This indicates a data loss condition "
+                "(e.g., date range mismatch, filter eliminating all rows, or corrupt source data)."
+            )
+
+        logger.info(f"Validated: {row_count:,} rows written to parquet file")
         logger.info(f"Success! Processed data saved to {output_path}")
         logger.info("Completed Streaming")
 

@@ -85,7 +85,12 @@ def load_gcs_to_bigquery(uri, dataset_id, table_id):
 
         load_job = bq_client.load_table_from_uri(uri, temp_table_id, job_config=job_config)
         load_job.result()
-        logger.info(f"Loaded temp table {temp_table_id} from {uri}")
+        
+        # Verify rows were actually loaded
+        loaded_rows = load_job.output_rows
+        if loaded_rows == 0:
+            raise RuntimeError(f"BigQuery load completed but 0 rows loaded from {uri}")
+        logger.info(f"Loaded {loaded_rows} rows to temp table {temp_table_id} from {uri}")
 
         # 2. Discover schema for dynamic SQL
         temp_table = bq_client.get_table(temp_table_id)

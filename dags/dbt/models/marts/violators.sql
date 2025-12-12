@@ -1,5 +1,7 @@
 {{ config(
-    materialized='table'
+    materialized='incremental',
+    unique_key=['meter_id', 'quarter'],
+    on_schema_change='append_new_columns'
 ) }}
 
 -- Violators: Meters that consume >3000W during prayer periods
@@ -7,6 +9,12 @@
 
 with consumption as (
     select * from {{ ref('consumption_analysis') }}
+    {% if is_incremental() %}
+        -- Only process meters/quarters that are new or have been updated
+        WHERE (meter_id, quarter) NOT IN (
+            SELECT meter_id, quarter FROM {{ this }}
+        )
+    {% endif %}
 ),
 
 quality as (

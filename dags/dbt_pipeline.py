@@ -47,7 +47,7 @@ with DAG(
             "ETL_ROW_GROUP_SIZE": os.environ.get("ETL_ROW_GROUP_SIZE", "250000"),
             "AIRFLOW_HOME": os.environ.get("AIRFLOW_HOME", "/usr/local/airflow"),
             "PARQUET_COMPRESSION": os.environ.get("PARQUET_COMPRESSION", "snappy"),
-            "ETL_ENABLE_ROW_HASH": os.environ.get("ETL_ENABLE_ROW_HASH", "false"),   
+            "ETL_ENABLE_ROW_HASH": os.environ.get("ETL_ENABLE_ROW_HASH", "true"),   
 
         },
     )

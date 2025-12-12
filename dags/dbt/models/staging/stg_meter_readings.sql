@@ -3,18 +3,18 @@ with source as (
 ),
 
 deduplicated as (
-    -- Remove duplicates using deterministic hash of METER_ID + DATA_TIME
+    -- Remove duplicates using ROW_HASH (METER_ID + DATA_TIME) created by etl_processor.py.
+    -- This ensures deduplication logic is identical to BigQuery MERGE in cloud_loader.py.
     select * from source
     qualify ROW_NUMBER() OVER (
-        PARTITION BY
-            FARM_FINGERPRINT(CONCAT(CAST(METER_ID as STRING), CAST(DATA_TIME as STRING)))
+        PARTITION BY ROW_HASH
         ORDER BY DATA_TIME DESC
     ) = 1
 ),
 
 renamed as (
     select
-        CAST(METER_NO as STRING) as meter_id,
+        CAST(METER_ID as STRING) as meter_id,
         DATA_TIME as reading_at,
 
         -- Filter outliers: Set to NULL if > 1GW (1,000,000,000 watts)

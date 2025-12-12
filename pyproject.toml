@@ -8,6 +8,7 @@ dependencies = [
     "dbt-bigquery>=1.10.3",
     "dbt-core>=1.10.8",
     "google-generativeai>=0.8.5",
+    "ipykernel>=7.1.0",
     "polars>=1.35.2",
     "pyarrow>=22.0.0",
 ]

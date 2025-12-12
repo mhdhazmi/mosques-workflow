@@ -1,5 +1,6 @@
 with readings as (
-    select * from {{ ref('stg_meter_readings') }}
+    -- Use int_exclude_ramadan to filter out Ramadan dates when configured
+    select * from {{ ref('int_exclude_ramadan') }}
 ),
 
 prayer_times as (

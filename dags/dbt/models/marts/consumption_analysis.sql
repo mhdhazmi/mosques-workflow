@@ -1,9 +1,22 @@
 {{ config(
-    materialized='table'
+    materialized='incremental',
+    unique_key='meter_id',
+    on_schema_change='append_new_columns'
 ) }}
 
 with period_data as (
     select * from {{ ref('int_meter_readings_with_periods') }}
+    {% if is_incremental() %}
+        -- Only process meters with new data: check if meter has readings after max date in existing table
+        WHERE meter_id IN (
+            SELECT DISTINCT meter_id 
+            FROM {{ ref('int_meter_readings_with_periods') }}
+            WHERE reading_date > (
+                SELECT COALESCE(MAX(max_reading_date), '1900-01-01') 
+                FROM {{ this }}
+            )
+        )
+    {% endif %}
 ),
 
 meter_info as (

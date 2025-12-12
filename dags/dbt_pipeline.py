@@ -1,8 +1,9 @@
 from airflow import DAG
-from airflow.operators.python import PythonOperator
 from airflow.operators.bash import BashOperator
+from airflow.sensors.python import PythonSensor
 from cosmos import DbtTaskGroup, ProjectConfig, ProfileConfig, ExecutionConfig
 from datetime import datetime
+import glob
 import os
 
 # --- CONFIGURATION ---
@@ -25,6 +26,18 @@ default_args = {
     "retries": 2,  # tests require >= 2
 }
 
+RAW_DATA_PATH = os.path.join(
+    os.environ.get("AIRFLOW_HOME", "/usr/local/airflow"), "include/raw_data"
+)
+
+
+def check_for_csv_files() -> bool:
+    """Check if any CSV files exist in the raw_data directory."""
+    csv_pattern = os.path.join(RAW_DATA_PATH, "*.csv")
+    files = glob.glob(csv_pattern)
+    return len(files) > 0
+
+
 with DAG(
     dag_id="meter_data_pipeline",
     default_args=default_args,
@@ -33,6 +46,16 @@ with DAG(
     catchup=False,
     tags=["meter_data", "dbt", "gcp"],  # makes tests happy, and self-docs
 ) as dag:
+
+    # 0. Sensor: Wait for new file in raw_data directory
+    wait_for_file = PythonSensor(
+        task_id="wait_for_raw_file",
+        python_callable=check_for_csv_files,
+        poke_interval=60,  # Check every 60 seconds
+        timeout=60 * 60 * 24,  # Timeout after 24 hours
+        mode="poke",  # Use "reschedule" for long waits to free up worker slot
+        soft_fail=False,
+    )
 
     # 1. Local Processing (The Grinder)
     run_etl = BashOperator(
@@ -47,8 +70,9 @@ with DAG(
             "ETL_ROW_GROUP_SIZE": os.environ.get("ETL_ROW_GROUP_SIZE", "250000"),
             "AIRFLOW_HOME": os.environ.get("AIRFLOW_HOME", "/usr/local/airflow"),
             "PARQUET_COMPRESSION": os.environ.get("PARQUET_COMPRESSION", "snappy"),
-            "ETL_ENABLE_ROW_HASH": os.environ.get("ETL_ENABLE_ROW_HASH", "true"),   
-
+            "ETL_ENABLE_ROW_HASH": os.environ.get("ETL_ENABLE_ROW_HASH", "true"),
+            # Pass DAG run ID for stats tracking
+            "AIRFLOW_RUN_ID": "{{ run_id }}",
         },
     )
 
@@ -73,6 +97,8 @@ with DAG(
             "GCS_UPLOAD_CHUNK_SIZE_MB": os.environ.get("GCS_UPLOAD_CHUNK_SIZE_MB", "10"),
             "GCS_UPLOAD_TIMEOUT": os.environ.get("GCS_UPLOAD_TIMEOUT", "300"),
             "AIRFLOW_HOME": os.environ.get("AIRFLOW_HOME", "/usr/local/airflow"),
+            # Pass DAG run ID for stats tracking
+            "AIRFLOW_RUN_ID": "{{ run_id }}",
         },
     )
 
@@ -104,8 +130,10 @@ with DAG(
                     "GCP_PROJECT_ID", "testing-444715"
                 ),
             },
+            # Pass DAG run ID to dbt for stats tracking
+            "vars": '{"pipeline_run_id": "{{ run_id }}"}',
         },
     )
 
     # Dependency Chain
-    run_etl >> run_upload >> transform_data
+    wait_for_file >> run_etl >> run_upload >> transform_data

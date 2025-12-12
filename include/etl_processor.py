@@ -5,9 +5,12 @@ import json
 import logging
 import time
 from datetime import datetime
+from typing import Optional
 
 import polars as pl
 import google.generativeai as genai
+
+from pipeline_stats import StageStats, insert_stats, get_run_id
 
 
 # =========================
@@ -648,13 +651,33 @@ def build_lazy_pipeline(
     return q
 
 
+def count_csv_rows(filepath: str, separator: str = ",") -> int:
+    """
+    Counts the number of rows in a CSV file (excluding header).
+    Uses streaming to handle large files efficiently.
+    """
+    try:
+        df = pl.scan_csv(
+            filepath,
+            separator=separator,
+            quote_char='"',
+            ignore_errors=True,
+            low_memory=True,
+        )
+        return df.select(pl.len()).collect().item()
+    except Exception as e:
+        logger.warning(f"Could not count CSV rows: {e}")
+        return 0
+
+
 def process_file_streaming(
     input_path: str, 
     output_dir: str, 
     col_mapping: dict, 
     important_only: bool = False,
     separator: str = ",",
-) -> bool:
+    run_id: Optional[str] = None,
+) -> tuple[bool, Optional[StageStats]]:
     """
     Streams data from CSV to Parquet using a Polars lazy pipeline.
     The heavy work (read, transform, write) executes at sink_parquet.
@@ -665,9 +688,25 @@ def process_file_streaming(
         col_mapping: Dictionary mapping original column names to expected names
         important_only: If True, process only important columns
         separator: CSV separator character
+        run_id: Optional DAG run ID for stats tracking
+    
+    Returns:
+        Tuple of (success: bool, stats: StageStats or None)
     """
     logger.info(f"Starting stream processing for {input_path}...")
     t0 = time.perf_counter()
+    
+    filename = os.path.basename(input_path)
+    if run_id is None:
+        run_id = get_run_id()
+    run_timestamp = datetime.now()
+    
+    # Get file size for stats
+    file_size_bytes = os.path.getsize(input_path) if os.path.exists(input_path) else 0
+    
+    # Count input rows before processing
+    rows_input = count_csv_rows(input_path, separator)
+    logger.info(f"Input file has {rows_input:,} rows")
 
     try:
         # 1. Determine Output Path based on Quarter
@@ -677,8 +716,8 @@ def process_file_streaming(
         target_dir = os.path.join(output_dir, quarter_folder)
         os.makedirs(target_dir, exist_ok=True)
 
-        filename = os.path.basename(input_path).replace(".csv", ".parquet")
-        output_path = os.path.join(target_dir, filename)
+        output_filename = filename.replace(".csv", ".parquet")
+        output_path = os.path.join(target_dir, output_filename)
 
         logger.info("2")  # simple progress marker
         q = build_lazy_pipeline(input_path, col_mapping, quarter_str, important_only, separator)
@@ -703,9 +742,25 @@ def process_file_streaming(
         if not os.path.exists(output_path):
             raise RuntimeError(f"Parquet file was not created at {output_path}")
 
-        # Read parquet metadata to verify row count without loading data into memory
-        parquet_metadata = pl.scan_parquet(output_path)
-        row_count = parquet_metadata.select(pl.len()).collect().item()
+        # Read parquet to collect stats
+        df_stats = pl.scan_parquet(output_path)
+        
+        # Collect various stats in one pass
+        stats_result = df_stats.select([
+            pl.len().alias("row_count"),
+            pl.col("METER_ID").n_unique().alias("unique_meters"),
+            pl.col("DATA_TIME").min().alias("min_date"),
+            pl.col("DATA_TIME").max().alias("max_date"),
+            pl.col("IMPORT_ACTIVE_POWER").is_null().sum().alias("null_power"),
+            (pl.col("IMPORT_ACTIVE_POWER") == 0).sum().alias("zero_power"),
+        ]).collect()
+        
+        row_count = stats_result["row_count"][0]
+        unique_meters = stats_result["unique_meters"][0]
+        min_date = stats_result["min_date"][0]
+        max_date = stats_result["max_date"][0]
+        null_power = stats_result["null_power"][0]
+        zero_power = stats_result["zero_power"][0]
 
         if row_count == 0:
             # Remove the empty file to avoid downstream confusion
@@ -721,19 +776,69 @@ def process_file_streaming(
         logger.info("Completed Streaming")
 
         t1 = time.perf_counter()
-        logger.info(f"Total process_file_streaming runtime: {t1 - t0:.2f} seconds")
-        return True
+        processing_seconds = t1 - t0
+        logger.info(f"Total process_file_streaming runtime: {processing_seconds:.2f} seconds")
+        
+        # Create stats record
+        stats = StageStats(
+            run_id=run_id,
+            run_timestamp=run_timestamp,
+            source_filename=filename,
+            stage_name="etl",
+            quarter=quarter_str,
+            rows_input=rows_input,
+            rows_output=row_count,
+            rows_filtered=rows_input - row_count if rows_input else 0,
+            filter_reason="date_parse_failures" if rows_input and rows_input > row_count else None,
+            unique_meters=unique_meters,
+            min_reading_date=min_date.strftime("%Y-%m-%d") if min_date else None,
+            max_reading_date=max_date.strftime("%Y-%m-%d") if max_date else None,
+            processing_seconds=processing_seconds,
+            file_size_bytes=file_size_bytes,
+            rows_with_null_power=null_power,
+            rows_with_zero_power=zero_power,
+            status="success",
+        )
+        
+        return True, stats
 
     except Exception as e:
         logger.error(f"Streaming failed for {input_path}: {e}")
-        return False
+        t1 = time.perf_counter()
+        
+        # Create failure stats record
+        stats = StageStats(
+            run_id=run_id,
+            run_timestamp=run_timestamp,
+            source_filename=filename,
+            stage_name="etl",
+            rows_input=rows_input,
+            file_size_bytes=file_size_bytes,
+            processing_seconds=t1 - t0,
+            status="failed",
+            error_message=str(e)[:500],  # Truncate long error messages
+        )
+        
+        return False, stats
 
 
 # =========================
 # MAIN ORCHESTRATION
 # =========================
 
+# Path to save ETL stats for cloud_loader to read
+STATS_OUTPUT_PATH = os.path.join(OUTPUT_DIR, "_etl_stats.json")
+
+
 def main() -> int:
+    """
+    Main ETL orchestration function.
+    Processes CSV files, collects stats, and saves them for downstream tasks.
+    """
+    # Get run ID from environment (set by Airflow DAG) or generate one
+    run_id = get_run_id()
+    logger.info(f"Starting ETL with run_id: {run_id}")
+    
     # Ensure directories exist
     if not os.path.exists(INPUT_DIR):
         os.makedirs(INPUT_DIR, exist_ok=True)
@@ -751,6 +856,9 @@ def main() -> int:
         return 0
 
     logger.info(f"Found {len(input_files)} files to process.")
+    
+    # Collect stats for all files
+    all_stats: list[StageStats] = []
 
     for input_file in input_files:
         filename = os.path.basename(input_file)
@@ -779,13 +887,35 @@ def main() -> int:
         important_only = schema_result.get("important_only", False)
 
         # 3. Process file with streaming pipeline
-        success = process_file_streaming(input_file, OUTPUT_DIR, mapping, important_only, separator)
+        success, stats = process_file_streaming(
+            input_file, OUTPUT_DIR, mapping, important_only, separator, run_id
+        )
+        
+        if stats:
+            all_stats.append(stats)
+        
         if not success:
             logger.error(f"ETL failed for {filename}. Aborting run.")
+            # Save stats even on failure for debugging
+            _save_stats_to_file(all_stats)
             return 1
 
+    # Save stats to JSON file for cloud_loader to read
+    _save_stats_to_file(all_stats)
+    
     logger.info("All files processed successfully.")
     return 0
+
+
+def _save_stats_to_file(stats_list: list[StageStats]) -> None:
+    """Save stats to a JSON file for the cloud_loader to read."""
+    try:
+        stats_data = [s.to_bq_row() for s in stats_list]
+        with open(STATS_OUTPUT_PATH, "w") as f:
+            json.dump(stats_data, f, indent=2, default=str)
+        logger.info(f"Saved {len(stats_list)} ETL stats records to {STATS_OUTPUT_PATH}")
+    except Exception as e:
+        logger.error(f"Failed to save stats to file: {e}")
 
 
 if __name__ == "__main__":

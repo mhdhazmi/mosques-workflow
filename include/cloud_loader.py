@@ -1,12 +1,22 @@
 import os
 import glob
+import json
 import logging
 import sys
 import time
 import uuid
+from datetime import datetime
+from typing import Optional
 
 from google.cloud import storage
 from google.cloud import bigquery
+
+from pipeline_stats import (
+    StageStats,
+    insert_stats_batch,
+    ensure_stats_table_exists,
+    get_run_id,
+)
 
 # --- CONFIGURATION ---
 PROJECT_ID = os.getenv("GCP_PROJECT_ID", "testing-444715")
@@ -83,9 +93,26 @@ def create_partitioned_table(bq_client, target_table_id, schema):
     return table
 
 
-def load_gcs_to_bigquery(uri, dataset_id, table_id):
-    """Loads data from GCS into BigQuery using INSERT with dedup for better performance."""
+def load_gcs_to_bigquery(
+    uri: str,
+    dataset_id: str,
+    table_id: str,
+    source_filename: str,
+    run_id: str,
+    run_timestamp: datetime,
+) -> tuple[bool, Optional[StageStats]]:
+    """
+    Loads data from GCS into BigQuery using INSERT with dedup for better performance.
+    
+    Returns:
+        Tuple of (success: bool, stats: StageStats or None)
+    """
     logger.info(f"Loading {uri} into BigQuery with deduplication...")
+    t0 = time.time()
+    
+    rows_input = 0
+    rows_inserted = 0
+    rows_duplicates_skipped = 0
 
     try:
         # ADC: uses default credentials
@@ -104,7 +131,8 @@ def load_gcs_to_bigquery(uri, dataset_id, table_id):
         load_job.result()
         
         # Verify rows were actually loaded
-        loaded_rows = load_job.output_rows
+        loaded_rows = load_job.output_rows or 0
+        rows_input = loaded_rows
         if loaded_rows == 0:
             raise RuntimeError(f"BigQuery load completed but 0 rows loaded from {uri}")
         logger.info(f"Loaded {loaded_rows} rows to temp table {temp_table_id} from {uri}")
@@ -140,6 +168,7 @@ def load_gcs_to_bigquery(uri, dataset_id, table_id):
             """
             query_job = bq_client.query(insert_query)
             query_job.result()
+            rows_inserted = loaded_rows
             logger.info(f"Inserted {loaded_rows} rows into new table {target_table_id}.")
         else:
             # Target exists - use INSERT with NOT EXISTS for deduplication (faster than MERGE)
@@ -156,11 +185,12 @@ def load_gcs_to_bigquery(uri, dataset_id, table_id):
                 """
                 logger.info("Running INSERT with deduplication on ROW_HASH...")
                 query_job = bq_client.query(insert_dedup_query)
-                result = query_job.result()
+                query_job.result()
                 
                 # Get rows inserted
                 rows_inserted = query_job.num_dml_affected_rows or 0
-                logger.info(f"Inserted {rows_inserted} new rows into {target_table_id} (skipped duplicates).")
+                rows_duplicates_skipped = loaded_rows - rows_inserted
+                logger.info(f"Inserted {rows_inserted} new rows into {target_table_id} (skipped {rows_duplicates_skipped} duplicates).")
             else:
                 logger.warning(
                     "ROW_HASH column not found in temp table; falling back to append-only INSERT."
@@ -172,6 +202,7 @@ def load_gcs_to_bigquery(uri, dataset_id, table_id):
                 """
                 query_job = bq_client.query(insert_query)
                 query_job.result()
+                rows_inserted = loaded_rows
                 logger.info(
                     f"Appended data from {temp_table_id} into {target_table_id} without dedup."
                 )
@@ -180,33 +211,131 @@ def load_gcs_to_bigquery(uri, dataset_id, table_id):
         bq_client.delete_table(temp_table_id, not_found_ok=True)
         logger.info(f"Cleaned up temp table {temp_table_id}.")
 
-        return True
+        processing_seconds = time.time() - t0
+        
+        # Create stats record
+        stats = StageStats(
+            run_id=run_id,
+            run_timestamp=run_timestamp,
+            source_filename=source_filename,
+            stage_name="upload",
+            rows_input=rows_input,
+            rows_output=rows_inserted,
+            rows_filtered=rows_duplicates_skipped,
+            rows_duplicates_skipped=rows_duplicates_skipped,
+            filter_reason="duplicate_row_hash" if rows_duplicates_skipped > 0 else None,
+            processing_seconds=processing_seconds,
+            status="success",
+        )
+        
+        return True, stats
+        
     except Exception as e:
         logger.error(f"BigQuery Load failed: {e}")
-        return False
+        processing_seconds = time.time() - t0
+        
+        stats = StageStats(
+            run_id=run_id,
+            run_timestamp=run_timestamp,
+            source_filename=source_filename,
+            stage_name="upload",
+            rows_input=rows_input,
+            processing_seconds=processing_seconds,
+            status="failed",
+            error_message=str(e)[:500],
+        )
+        
+        return False, stats
 
 
-if __name__ == "__main__":
+def load_etl_stats() -> list[dict]:
+    """Load ETL stats from JSON file created by etl_processor."""
+    stats_path = os.path.join(LOCAL_OUTPUT_DIR, "_etl_stats.json")
+    if os.path.exists(stats_path):
+        try:
+            with open(stats_path, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Failed to load ETL stats: {e}")
+    return []
+
+
+def main() -> int:
+    """
+    Main cloud upload orchestration function.
+    Uploads parquet files to GCS, loads to BigQuery, and records stats.
+    """
+    run_id = get_run_id()
+    run_timestamp = datetime.now()
+    logger.info(f"Starting cloud upload with run_id: {run_id}")
+    
     # Check if local directory exists
     if not os.path.exists(LOCAL_OUTPUT_DIR):
         logger.error(
             f"Local directory {LOCAL_OUTPUT_DIR} not found. Run etl_processor.py first."
         )
-        exit(1)
+        return 1
 
     parquet_files = glob.glob(os.path.join(LOCAL_OUTPUT_DIR, "**/*.parquet"), recursive=True)
 
     if not parquet_files:
         logger.warning(f"No Parquet files found in {LOCAL_OUTPUT_DIR}")
-        exit(0)
+        return 0
 
     logger.info(f"Found {len(parquet_files)} files to upload.")
+    
+    # Load ETL stats from file
+    etl_stats_data = load_etl_stats()
+    
+    # Collect all stats (ETL + upload)
+    all_stats: list[StageStats] = []
+    
+    # Convert ETL stats dicts back to StageStats objects
+    for stat_dict in etl_stats_data:
+        try:
+            # Parse timestamp back to datetime
+            if isinstance(stat_dict.get("run_timestamp"), str):
+                stat_dict["run_timestamp"] = datetime.fromisoformat(stat_dict["run_timestamp"])
+            all_stats.append(StageStats(**stat_dict))
+        except Exception as e:
+            logger.warning(f"Failed to parse ETL stat: {e}")
 
     for local_file in parquet_files:
         relative_path = os.path.relpath(local_file, LOCAL_OUTPUT_DIR)
         gcs_path = f"{GCS_PREFIX}{relative_path}"
+        
+        # Get source filename from parquet path (remove quarter folder prefix)
+        source_filename = os.path.basename(local_file).replace(".parquet", ".csv")
 
         gcs_uri = upload_to_gcs(BUCKET_NAME, local_file, gcs_path)
 
         if gcs_uri:
-            load_gcs_to_bigquery(gcs_uri, DATASET_ID, TABLE_ID)
+            success, stats = load_gcs_to_bigquery(
+                gcs_uri, DATASET_ID, TABLE_ID,
+                source_filename=source_filename,
+                run_id=run_id,
+                run_timestamp=run_timestamp,
+            )
+            if stats:
+                all_stats.append(stats)
+            
+            if not success:
+                logger.error(f"Failed to load {gcs_uri} to BigQuery")
+                # Continue with other files, but record the failure
+    
+    # Write all stats to BigQuery
+    if all_stats:
+        logger.info(f"Writing {len(all_stats)} stats records to BigQuery...")
+        try:
+            bq_client = bigquery.Client(project=PROJECT_ID)
+            ensure_stats_table_exists(bq_client)
+            insert_stats_batch(all_stats, bq_client)
+        except Exception as e:
+            logger.error(f"Failed to write stats to BigQuery: {e}")
+    
+    logger.info("Cloud upload completed.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

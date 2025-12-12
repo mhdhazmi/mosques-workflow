@@ -8,11 +8,13 @@
 -- Only includes meters with good data quality (>50% non-missing/non-zero readings)
 
 with consumption as (
-    select * from {{ ref('consumption_analysis') }}
+    select * from {{ ref('consumption_analysis') }} c
     {% if is_incremental() %}
         -- Only process meters/quarters that are new or have been updated
-        WHERE (meter_id, quarter) NOT IN (
-            SELECT meter_id, quarter FROM {{ this }}
+        WHERE NOT EXISTS (
+            SELECT 1 FROM {{ this }} t
+            WHERE t.meter_id = c.meter_id 
+              AND t.quarter = c.quarter
         )
     {% endif %}
 ),

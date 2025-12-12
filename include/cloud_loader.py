@@ -65,8 +65,26 @@ def upload_to_gcs(bucket_name, source_file, destination_blob_name):
         return None
 
 
+def create_partitioned_table(bq_client, target_table_id, schema):
+    """Creates a partitioned and clustered table for optimal query performance."""
+    table = bigquery.Table(target_table_id, schema=schema)
+    
+    # Partition by DATA_TIME (day-level partitioning)
+    table.time_partitioning = bigquery.TimePartitioning(
+        type_=bigquery.TimePartitioningType.DAY,
+        field="DATA_TIME",
+    )
+    
+    # Cluster by ROW_HASH for fast MERGE lookups
+    table.clustering_fields = ["ROW_HASH"]
+    
+    table = bq_client.create_table(table)
+    logger.info(f"Created partitioned table {target_table_id} (partitioned by DATA_TIME, clustered by ROW_HASH)")
+    return table
+
+
 def load_gcs_to_bigquery(uri, dataset_id, table_id):
-    """Loads data from GCS into BigQuery using MERGE on ROW_HASH when possible."""
+    """Loads data from GCS into BigQuery using INSERT with dedup for better performance."""
     logger.info(f"Loading {uri} into BigQuery with deduplication...")
 
     try:
@@ -80,7 +98,6 @@ def load_gcs_to_bigquery(uri, dataset_id, table_id):
         job_config = bigquery.LoadJobConfig(
             source_format=bigquery.SourceFormat.PARQUET,
             write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
-            # schema_update_options removed as it conflicts with WRITE_TRUNCATE
         )
 
         load_job = bq_client.load_table_from_uri(uri, temp_table_id, job_config=job_config)
@@ -102,24 +119,48 @@ def load_gcs_to_bigquery(uri, dataset_id, table_id):
         columns_str = ", ".join(f"`{c}`" for c in temp_columns)
         values_str = ", ".join(f"S.`{c}`" for c in temp_columns)
 
-        # 3. MERGE or INSERT into Target
+        # 3. Check if target table exists
+        target_exists = False
         try:
-            # Check if target exists
             bq_client.get_table(target_table_id)
+            target_exists = True
+        except Exception:
+            pass
 
+        if not target_exists:
+            # Create partitioned/clustered table from scratch
+            logger.info(f"Target table {target_table_id} does not exist. Creating with partitioning...")
+            create_partitioned_table(bq_client, target_table_id, temp_table.schema)
+            
+            # Insert all data from temp table
+            insert_query = f"""
+            INSERT `{target_table_id}` ({columns_str})
+            SELECT {values_str}
+            FROM `{temp_table_id}` AS S
+            """
+            query_job = bq_client.query(insert_query)
+            query_job.result()
+            logger.info(f"Inserted {loaded_rows} rows into new table {target_table_id}.")
+        else:
+            # Target exists - use INSERT with NOT EXISTS for deduplication (faster than MERGE)
             if "ROW_HASH" in temp_columns:
-                merge_query = f"""
-                MERGE `{target_table_id}` T
-                USING `{temp_table_id}` S
-                ON T.ROW_HASH = S.ROW_HASH
-                WHEN NOT MATCHED THEN
-                  INSERT ({columns_str})
-                  VALUES ({values_str})
+                # Use INSERT...SELECT with NOT EXISTS - much faster than MERGE for large tables
+                insert_dedup_query = f"""
+                INSERT `{target_table_id}` ({columns_str})
+                SELECT {values_str}
+                FROM `{temp_table_id}` AS S
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM `{target_table_id}` T 
+                    WHERE T.ROW_HASH = S.ROW_HASH
+                )
                 """
-                logger.info("Running MERGE to deduplicate on ROW_HASH...")
-                query_job = bq_client.query(merge_query)
-                query_job.result()
-                logger.info(f"Merged data from {temp_table_id} into {target_table_id}.")
+                logger.info("Running INSERT with deduplication on ROW_HASH...")
+                query_job = bq_client.query(insert_dedup_query)
+                result = query_job.result()
+                
+                # Get rows inserted
+                rows_inserted = query_job.num_dml_affected_rows or 0
+                logger.info(f"Inserted {rows_inserted} new rows into {target_table_id} (skipped duplicates).")
             else:
                 logger.warning(
                     "ROW_HASH column not found in temp table; falling back to append-only INSERT."
@@ -134,13 +175,6 @@ def load_gcs_to_bigquery(uri, dataset_id, table_id):
                 logger.info(
                     f"Appended data from {temp_table_id} into {target_table_id} without dedup."
                 )
-        except Exception as e:
-            # Target table doesn't exist yet; create from temp
-            logger.info(
-                f"Target table {target_table_id} does not exist. Creating from temp table. ({e})"
-            )
-            bq_client.copy_table(temp_table_id, target_table_id).result()
-            logger.info(f"Created {target_table_id} from {temp_table_id}.")
 
         # 4. Cleanup Temp Table
         bq_client.delete_table(temp_table_id, not_found_ok=True)

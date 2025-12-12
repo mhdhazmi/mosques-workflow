@@ -25,7 +25,8 @@ with meter_stats as (
         -- NULL readings (already filtered in staging but check anyway)
         SUM(CASE WHEN active_power_watts IS NULL THEN 1 ELSE 0 END) as null_readings
 
-    from {{ ref('stg_meter_readings') }}
+    -- Use int_exclude_ramadan to filter out Ramadan dates when configured
+    from {{ ref('int_exclude_ramadan') }}
     group by meter_id
 )
 
@@ -45,14 +46,14 @@ select
     -- Quality percentage (good readings / expected)
     CASE
         WHEN expected_readings > 0 THEN
-            ROUND(((actual_readings - zero_readings) / expected_readings) * 100, 2)
+            ROUND((actual_readings - zero_readings) / CAST(expected_readings AS FLOAT64) * 100, 2)
         ELSE 0
     END as quality_percentage,
 
     -- Quality flag (good if >= 50%)
     CASE
         WHEN expected_readings > 0
-            AND ((actual_readings - zero_readings) / expected_readings) * 100 >= 50
+            AND (actual_readings - zero_readings) / CAST(expected_readings AS FLOAT64) * 100 >= 50
         THEN TRUE
         ELSE FALSE
     END as is_good_quality

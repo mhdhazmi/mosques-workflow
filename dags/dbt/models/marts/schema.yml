@@ -2,9 +2,9 @@ version: 2
 
 models:
   - name: consumption_stats
-    description: "Daily aggregated consumption statistics per meter"
+    description: "Daily aggregated consumption statistics per meter (via stg_meter_readings)"
     columns:
-      - name: METER_ID
+      - name: meter_id
         description: "Unique identifier for the smart meter"
         tests:
           - not_null
@@ -12,11 +12,17 @@ models:
         description: "Date of the readings"
         tests:
           - not_null
+      - name: quarter
+        description: "Quarter in YYYY-QN format"
       - name: avg_daily_power_watts
         description: "Average active power import for the day"
+      - name: max_daily_power_watts
+        description: "Maximum active power import for the day"
+      - name: min_daily_power_watts
+        description: "Minimum active power import for the day"
       - name: readings_count
         description: "Number of readings aggregated for this day"
 
     tests:
       - unique:
-          column_name: "(METER_ID || '-' || date)" # Composite uniqueness check
+          column_name: "(meter_id || '-' || date)" # Composite uniqueness check

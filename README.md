@@ -11,7 +11,9 @@ This guide provides a complete end-to-end walkthrough for setting up, configurin
 - [Running the Pipeline](#6-running-the-pipeline)
 - [Pipeline Architecture](#7-pipeline-architecture--data-flow)
 - [dbt Models Documentation](#8-dbt-models-documentation)
-- [Troubleshooting](#9-troubleshooting)
+- [Violator Analysis](#9-violator-analysis)
+- [Pipeline Statistics](#10-pipeline-statistics)
+- [Troubleshooting](#11-troubleshooting)
 
 ---
 
@@ -127,6 +129,15 @@ The pipeline behavior is controlled by environment variables.
         *   `PARQUET_COMPRESSION="snappy"`: Fast compression.
         *   `ETL_ENABLE_ROW_HASH="true"`: Enables deduplication logic.
 
+3.  **Configure Ramadan Exclusion (Optional)**:
+    To exclude Ramadan dates from analysis, add to `dags/dbt/dbt_project.yml`:
+    ```yaml
+    vars:
+      ramadan_start: '2025-02-28'
+      ramadan_end: '2025-03-30'
+    ```
+    When not configured, all dates are included in analysis.
+
 ---
 
 ## 5. Loading Reference Data (dbt Seeds)
@@ -210,20 +221,27 @@ Seeds are CSV files in `dags/dbt/seeds/` that contain static reference data. The
 
 ```
 ┌─────────────────────┐
+│  File Sensor        │  ← Waits for CSV files in include/raw_data/
+│  (PythonSensor)     │     Polls every 60 seconds, 24h timeout
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
 │  Raw CSV Files      │  ← Smart meter readings (include/raw_data/)
 └──────────┬──────────┘
            │
            ▼
-┌─────────────────────┐
-│  ETL Processor      │  ← Schema validation (Gemini LLM), deduplication,
-│  (etl_processor.py) │     outlier filtering, parquet conversion
-└──────────┬──────────┘
-           │
+┌─────────────────────┐     ┌─────────────────────┐
+│  ETL Processor      │ ──► │  Pipeline Stats     │
+│  (etl_processor.py) │     │  (pipeline_stats)   │
+└──────────┬──────────┘     └─────────────────────┘
+           │                  ↑ Tracks row counts,
+           │                    processing times
            ▼
-┌─────────────────────┐
-│  Cloud Loader       │  ← Upload to GCS, load to BigQuery with MERGE
-│  (cloud_loader.py)  │
-└──────────┬──────────┘
+┌─────────────────────┐     ┌─────────────────────┐
+│  Cloud Loader       │ ──► │  Pipeline Stats     │
+│  (cloud_loader.py)  │     │  (pipeline_stats)   │
+└──────────┬──────────┘     └─────────────────────┘
            │
            ▼
 ┌─────────────────────────────────────────────────────────┐
@@ -231,18 +249,23 @@ Seeds are CSV files in `dags/dbt/seeds/` that contain static reference data. The
 │  - smart_meters_clean (fact: meter readings)            │
 │  - prayer_times (dimension: from dbt seed)              │
 │  - industry_codes (dimension: from dbt seed)            │
+│  - pipeline_stats (tracking: run statistics)            │
 └──────────┬──────────────────────────────────────────────┘
            │
            ▼
 ┌─────────────────────┐
 │  dbt Transformations│  ← Staging → Intermediate → Marts
-│  (Cosmos/dbt)       │
+│  (Cosmos/dbt)       │     + Statistics tracking models
 └──────────┬──────────┘
            │
            ▼
 ┌─────────────────────────────────────────────────────────┐
 │              Analytics Tables (Marts)                    │
-│  - consumption_analysis (final metrics by meter)        │
+│  - consumption_analysis (consumption metrics, incr.)    │
+│  - violators (over-consumers >3000W, incremental)       │
+│  - consumption_riyadh (Riyadh regional analysis)        │
+│  - violators_riyadh (Riyadh over-consumer report)       │
+│  - riyadh_quarter_report (summary with team comparison) │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -262,7 +285,11 @@ Seeds are CSV files in `dags/dbt/seeds/` that contain static reference data. The
 - **Optimizations**:
   - Streaming pipeline (low memory mode)
   - Polars for fast processing
-  - Partitioned by quarter (e.g., `2023-Q4`)
+  - Partitioned by quarter (e.g., `2025-Q3`)
+- **Statistics Tracking**:
+  - Records row counts before/after processing
+  - Tracks duplicate rows skipped
+  - Logs processing time per file
 - **Output**: Parquet files in `include/processed_data/`
 
 #### B. Cloud Loader (`include/cloud_loader.py`)
@@ -273,7 +300,11 @@ Seeds are CSV files in `dags/dbt/seeds/` that contain static reference data. The
 - **BigQuery Load**:
   - Uses **MERGE** on `ROW_HASH` to avoid duplicates
   - UUID-named temp tables for safe parallel runs
-  - Automatically creates target table if missing
+  - Automatically creates partitioned table if missing (by `DATA_TIME`, clustered by `ROW_HASH`)
+  - Checks if data already exists before loading
+- **Statistics Tracking**:
+  - Records upload status and times
+  - Tracks new rows vs. updated rows
 - **Output**: `raw_meter_readings.smart_meters_clean` table
 
 #### C. dbt Transformations (via Airflow Cosmos)
@@ -307,13 +338,25 @@ Staging Layer (stg_*)
           ↓
 
 Intermediate Layer (int_*)
-├── int_meter_locations      ← Match meters to nearest prayer location
-└── int_meter_readings_with_periods ← Join readings with prayer periods
+├── int_meter_locations           ← Match meters to nearest prayer location
+├── int_exclude_ramadan           ← Filter out Ramadan dates (configurable)
+├── int_meter_readings_with_periods ← Join readings with prayer periods
+└── int_meter_quality             ← Calculate quality score per meter
 
           ↓
 
 Marts Layer
-└── consumption_analysis     ← Final aggregated metrics
+├── consumption_analysis     ← Final aggregated metrics (incremental)
+├── violators                ← Meters exceeding 3000W threshold (incremental)
+├── consumption_riyadh       ← Riyadh-specific consumption analysis
+├── violators_riyadh         ← Riyadh violators report
+└── riyadh_quarter_report    ← Summary report matching team format
+
+          ↓
+
+Statistics Tracking
+├── stats_staging            ← Dedup/outlier filtering stats
+└── stats_ramadan            ← Ramadan exclusion stats
 ```
 
 ---
@@ -475,6 +518,59 @@ on EXTRACT(MONTH FROM r.reading_date) = EXTRACT(MONTH FROM p.date)
 
 ---
 
+#### `int_exclude_ramadan.sql`
+**Purpose**: Filter out Ramadan dates from meter readings when configured.
+
+**Materialization**: `view`
+
+**Configuration**:
+Ramadan dates are configurable via dbt variables in `dbt_project.yml`:
+```yaml
+vars:
+  ramadan_start: '2025-02-28'
+  ramadan_end: '2025-03-30'
+```
+
+**Behavior**:
+- When Ramadan dates are configured, readings within that range are excluded
+- When not configured (default), all readings pass through unchanged
+- Useful for analyzing consumption patterns outside of Ramadan when usage differs
+
+**Output**: All columns from `stg_meter_readings`, filtered by date range.
+
+---
+
+#### `int_meter_quality.sql`
+**Purpose**: Calculate data quality score for each meter to filter unreliable data.
+
+**Materialization**: `view`
+
+**Quality Calculation**:
+```sql
+-- Quality = (actual_readings - zero_readings) / expected_readings * 100
+-- Expected readings = 48 per day (30-minute intervals)
+quality_percentage = (actual_readings - zero_readings) / (date_range_days * 48) * 100
+```
+
+**Output Columns**:
+| Column | Type | Description |
+|--------|------|-------------|
+| meter_id | STRING | Meter identifier |
+| min_date, max_date | DATE | Date range of readings |
+| date_range_days | INT64 | Number of days with data |
+| expected_readings | INT64 | Expected readings (48/day) |
+| actual_readings | INT64 | Actual readings count |
+| zero_readings | INT64 | Readings with zero power |
+| missing_readings | INT64 | Expected - actual |
+| quality_percentage | FLOAT64 | Quality score (0-100%) |
+| is_good_quality | BOOLEAN | TRUE if >= 50% quality |
+
+**Quality Threshold**:
+- Meters with `quality_percentage >= 50%` are flagged as `is_good_quality = TRUE`
+- Used by downstream models to filter out unreliable meters
+
+---
+
 ### 🎯 Marts Models (`dags/dbt/models/marts/`)
 
 Marts are business-ready tables for reporting and analysis.
@@ -482,7 +578,12 @@ Marts are business-ready tables for reporting and analysis.
 #### `consumption_analysis.sql`
 **Purpose**: Final aggregated consumption metrics per meter with period analysis.
 
-**Materialization**: `table` (for query performance)
+**Materialization**: `incremental` (with unique key on `meter_id`)
+
+**Incremental Logic**:
+- Only processes meters with new data (readings after max date in existing table)
+- Supports schema evolution with `on_schema_change='append_new_columns'`
+- Tracks quarter identifier (e.g., "2025-Q3") for each record
 
 **Aggregations**:
 
@@ -541,6 +642,91 @@ Removes ~1.3% of meters with no prayer time matches.
 
 ---
 
+#### `violators.sql`
+**Purpose**: Identify meters consuming >3000W during prayer periods (over-consumers).
+
+**Materialization**: `incremental` (with unique key on `[meter_id, quarter]`)
+
+**Quality Filter**: Only includes meters with `is_good_quality = TRUE` (>50% quality score).
+
+**Threshold**: 3000W average consumption during morning OR evening periods.
+
+**Output Columns**:
+| Column | Type | Description |
+|--------|------|-------------|
+| meter_id | STRING | Meter identifier |
+| quarter | STRING | Quarter identifier (e.g., "2025-Q3") |
+| morning_avg_mf, evening_avg_mf | FLOAT64 | Avg consumption × multiplication factor |
+| over_in_morning | BOOLEAN | TRUE if morning avg > 3000W |
+| over_in_evening | BOOLEAN | TRUE if evening avg > 3000W |
+| over_in_both | BOOLEAN | TRUE if exceeds in both periods |
+| over_in_either | BOOLEAN | TRUE if exceeds in at least one period |
+| violation_category | STRING | `BOTH_PERIODS`, `MORNING_ONLY`, `EVENING_ONLY`, or `COMPLIANT` |
+| potential_savings_morning_sar | FLOAT64 | Cost savings if reduced to 500W |
+| potential_savings_evening_sar | FLOAT64 | Cost savings if reduced to 500W |
+| total_potential_savings_sar | FLOAT64 | Combined potential savings |
+
+**Key Logic**:
+```sql
+-- Over-consumer threshold
+CASE
+    WHEN morning_avg_consumption * multiplication_factor > 3000
+    THEN TRUE ELSE FALSE
+END as over_in_morning
+
+-- Potential savings calculation (reduce to 500W normal level)
+((morning_avg_mf - 500) * morning_reading_count / 2 / 1000) * 0.32
+```
+
+---
+
+#### `consumption_riyadh.sql`
+**Purpose**: All Riyadh meters with quality filtering and over-consumer flags.
+
+**Materialization**: `table`
+
+**Filter Criteria**:
+- Region = 'Central' AND Province contains 'RIYADH'
+- Quality filter: `is_good_quality = TRUE`
+
+**Output**: All consumption metrics plus over-consumer flags for Riyadh region.
+
+---
+
+#### `violators_riyadh.sql`
+**Purpose**: Riyadh-specific violators report with summary statistics.
+
+**Materialization**: `table`
+
+**Output Columns**:
+- All columns from `consumption_riyadh` where `over_in_either = TRUE`
+- Window function aggregates:
+  - `total_overs_morning` - Count of morning violators
+  - `total_overs_evening` - Count of evening violators
+  - `total_overs_both` - Count of both-period violators
+  - `total_violators_riyadh` - Total Riyadh violators
+
+---
+
+#### `riyadh_quarter_report.sql`
+**Purpose**: Aggregated summary report matching team's format for comparison.
+
+**Materialization**: `table`
+
+**Output Columns**:
+| Column | Description |
+|--------|-------------|
+| total_meters_before_quality_filter | Meters before quality check |
+| total_meters_after_quality_filter | Meters after quality check |
+| overs_morning, overs_evening, overs_both, overs_either | Violator counts |
+| over_consumers_gwh | Total energy by over-consumers (GWh) |
+| over_consumers_cost_million_sar | Total cost by over-consumers (M SAR) |
+| regular_consumers_gwh | Total energy by compliant meters (GWh) |
+| regular_consumers_cost_million_sar | Total cost by compliant meters (M SAR) |
+| team_* columns | Reference values from team's analysis for comparison |
+
+---
+
 ### 🔍 Understanding the Analysis
 
 **Why exclude Fridays from morning analysis?**
@@ -554,7 +740,143 @@ Some meters have current transformers (CTs) that scale down readings. The multip
 
 ---
 
-## 9. Data Quality & Metrics
+## 9. Violator Analysis
+
+The pipeline includes specialized models for identifying and analyzing "violator" meters - those that consume excessive energy during prayer periods when mosques should be minimally occupied.
+
+### What is a Violator?
+
+A violator (over-consumer) is a meter that averages **>3000W** during:
+- **Morning Period**: Fajr + 100 min to Dhuhr - 80 min (excludes Fridays)
+- **Evening Period**: Isha + 90 min to Fajr - 80 min (wraps midnight)
+
+### Quality Filter
+
+Only meters with **good data quality** (>50% quality score) are included in violator analysis. This ensures:
+- Meters have sufficient data points for reliable averaging
+- Zero readings and missing data are accounted for
+- False positives from incomplete data are avoided
+
+### Violation Categories
+
+| Category | Description |
+|----------|-------------|
+| `BOTH_PERIODS` | Exceeds threshold in morning AND evening |
+| `MORNING_ONLY` | Exceeds threshold only in morning period |
+| `EVENING_ONLY` | Exceeds threshold only in evening period |
+| `COMPLIANT` | Below threshold in both periods |
+
+### Potential Savings Calculation
+
+The pipeline calculates potential cost savings if over-consumers reduced consumption to a normal level (500W):
+
+```sql
+-- Potential savings formula
+savings_sar = ((avg_consumption - 500) * reading_count / 2 / 1000) * 0.32
+```
+
+### Riyadh Reports
+
+Specialized reports for Riyadh region include:
+- **`consumption_riyadh`**: All Riyadh meters with quality filtering
+- **`violators_riyadh`**: Only Riyadh over-consumers with summary stats
+- **`riyadh_quarter_report`**: Aggregated summary with team comparison values
+
+### Example Query - Find Top Violators:
+
+```sql
+SELECT
+    meter_id,
+    violation_category,
+    morning_avg_mf as morning_watts,
+    evening_avg_mf as evening_watts,
+    total_potential_savings_sar
+FROM `raw_meter_readings.violators`
+WHERE over_in_both = TRUE
+ORDER BY total_potential_savings_sar DESC
+LIMIT 20;
+```
+
+---
+
+## 10. Pipeline Statistics
+
+The pipeline tracks detailed statistics at each processing stage for monitoring, debugging, and auditing.
+
+### Statistics Table
+
+All pipeline statistics are stored in `raw_meter_readings.pipeline_stats` with the following structure:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| run_id | STRING | Airflow DAG run ID or local run identifier |
+| run_timestamp | TIMESTAMP | When the stage was processed |
+| source_filename | STRING | Input file being processed |
+| quarter | STRING | Quarter identifier (e.g., "2025-Q3") |
+| stage_name | STRING | Processing stage name |
+| rows_input | INT64 | Rows entering this stage |
+| rows_output | INT64 | Rows leaving this stage |
+| rows_filtered | INT64 | Rows removed at this stage |
+| filter_reason | STRING | Why rows were filtered |
+| unique_meters | INT64 | Distinct meter count |
+| processing_seconds | FLOAT64 | Time taken for this stage |
+| status | STRING | `success` or `error` |
+| error_message | STRING | Error details if failed |
+
+### Tracked Stages
+
+1. **ETL Stage** (`etl_processor.py`):
+   - Row counts before/after processing
+   - Duplicate rows skipped
+   - Outlier filtering stats
+   - Processing time per file
+
+2. **Cloud Load Stage** (`cloud_loader.py`):
+   - Upload status
+   - BigQuery merge statistics
+   - New rows vs. updated rows
+
+3. **dbt Staging Stats** (`stats_staging.sql`):
+   - Deduplication effects
+   - Outlier filtering counts
+   - Unique meter counts
+
+4. **Ramadan Filter Stats** (`stats_ramadan.sql`):
+   - Rows excluded due to Ramadan dates
+   - Active date range configuration
+
+### Run ID Tracking
+
+Each pipeline run is assigned a unique `run_id`:
+- **Airflow**: Uses DAG run ID (e.g., `manual__2025-01-15T10:30:00`)
+- **Local**: Generates timestamp-based ID (e.g., `local_20250115_103000`)
+
+The run ID is passed through the entire pipeline for end-to-end traceability.
+
+### Example Queries:
+
+```sql
+-- Check latest pipeline run stats
+SELECT *
+FROM `raw_meter_readings.pipeline_stats`
+WHERE run_id = (SELECT MAX(run_id) FROM `raw_meter_readings.pipeline_stats`)
+ORDER BY run_timestamp;
+
+-- Check filtering effectiveness over time
+SELECT
+    DATE(run_timestamp) as run_date,
+    stage_name,
+    SUM(rows_input) as total_input,
+    SUM(rows_filtered) as total_filtered,
+    ROUND(SUM(rows_filtered) / SUM(rows_input) * 100, 2) as filter_pct
+FROM `raw_meter_readings.pipeline_stats`
+GROUP BY run_date, stage_name
+ORDER BY run_date DESC;
+```
+
+---
+
+## 11. Data Quality & Metrics
 
 After running the full pipeline, expect:
 
@@ -571,7 +893,7 @@ After running the full pipeline, expect:
 
 ---
 
-## 10. Troubleshooting
+## 12. Troubleshooting
 
 ### dbt Seed Issues
 
@@ -613,7 +935,7 @@ If seeing consumption > 100kW:
 
 ---
 
-## 11. Development Commands
+## 13. Development Commands
 
 ### Local dbt Development (without Airflow):
 
@@ -663,7 +985,7 @@ ORDER BY total_energy_kwh DESC;
 
 ---
 
-## 12. Project Structure
+## 14. Project Structure
 
 ```
 .
@@ -673,23 +995,34 @@ ORDER BY total_energy_kwh DESC;
 │   │   │   ├── staging/           # Bronze → Silver transformations
 │   │   │   │   ├── stg_meter_readings.sql
 │   │   │   │   ├── stg_prayer_times.sql
-│   │   │   │   └── stg_industry_codes.sql
+│   │   │   │   ├── stg_industry_codes.sql
+│   │   │   │   ├── int_exclude_ramadan.sql    # Ramadan date filter
+│   │   │   │   ├── stats_staging.sql          # Staging statistics
+│   │   │   │   └── stats_ramadan.sql          # Ramadan filter statistics
 │   │   │   └── marts/             # Silver → Gold analytics
 │   │   │       ├── int_meter_locations.sql
+│   │   │       ├── int_meter_quality.sql      # Data quality scoring
 │   │   │       ├── int_meter_readings_with_periods.sql
-│   │   │       └── consumption_analysis.sql
+│   │   │       ├── consumption_analysis.sql   # Main consumption metrics
+│   │   │       ├── violators.sql              # Over-consumer detection
+│   │   │       ├── consumption_riyadh.sql     # Riyadh regional analysis
+│   │   │       ├── violators_riyadh.sql       # Riyadh violators report
+│   │   │       ├── riyadh_quarter_report.sql  # Summary report
+│   │   │       └── schema.yml                 # Model documentation
 │   │   ├── seeds/                 # Reference data CSVs
 │   │   │   ├── prayer_times.csv
 │   │   │   └── industry_codes.csv
 │   │   ├── sources.yml            # Source table definitions
 │   │   └── dbt_project.yml
-│   └── dbt_pipeline.py            # Airflow DAG
+│   └── dbt_pipeline.py            # Airflow DAG (with file sensor)
 ├── include/
 │   ├── etl_processor.py           # CSV → Parquet ETL
 │   ├── cloud_loader.py            # Parquet → BigQuery
+│   ├── pipeline_stats.py          # Statistics tracking module
 │   ├── gcp_adc.json              # GCP credentials (git-ignored)
 │   ├── profiles.yml               # dbt BigQuery connection
-│   └── raw_data/                  # Input CSV files
+│   ├── raw_data/                  # Input CSV files
+│   └── processed_data/            # Output Parquet files
 ├── infra/                         # Terraform configs
 ├── .env                           # Environment variables
 ├── issues.md                      # Known issues and resolutions
@@ -698,7 +1031,7 @@ ORDER BY total_energy_kwh DESC;
 
 ---
 
-## 13. Next Steps
+## 15. Next Steps
 
 After completing the setup:
 
@@ -711,7 +1044,7 @@ After completing the setup:
 
 ---
 
-## 14. Contributing
+## 16. Contributing
 
 When making changes:
 1. Update this README if adding new models or changing the pipeline

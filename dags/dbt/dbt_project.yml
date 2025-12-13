@@ -19,4 +19,4 @@ clean-targets:         # directories to be removed by 'dbt clean'
 models:
   my_energy_project:
     # Config for all models
-    materialized: view
+    +materialized: view

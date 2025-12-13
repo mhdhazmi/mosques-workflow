@@ -1,13 +1,19 @@
 version: 2
 
 models:
+<<<<<<< HEAD
   - name: consumption_stats
     description: "Daily aggregated consumption statistics per meter (via stg_meter_readings)"
+=======
+  - name: consumption_analysis
+    description: "Aggregated consumption analysis per meter with morning/evening period breakdowns"
+>>>>>>> dbt_models
     columns:
       - name: meter_id
         description: "Unique identifier for the smart meter"
         tests:
           - not_null
+<<<<<<< HEAD
       - name: date
         description: "Date of the readings"
         tests:
@@ -26,3 +32,16 @@ models:
     tests:
       - unique:
           column_name: "(meter_id || '-' || date)" # Composite uniqueness check
+=======
+          - unique
+      - name: total_avg_consumption
+        description: "Average consumption across all readings"
+      - name: morning_avg_consumption
+        description: "Average consumption during morning prayer period (excluding Fridays)"
+      - name: evening_avg_consumption
+        description: "Average consumption during evening period (after Isha to before Fajr)"
+      - name: total_energy_kwh
+        description: "Total energy consumption in kWh"
+      - name: data_quality_flag
+        description: "Data quality indicator: COMPLETE, NO_MORNING_DATA, NO_EVENING_DATA, or NO_PERIOD_DATA"
+>>>>>>> dbt_models

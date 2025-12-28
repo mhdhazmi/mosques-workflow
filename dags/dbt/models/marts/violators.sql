@@ -4,18 +4,50 @@
     on_schema_change='append_new_columns'
 ) }}
 
--- Violators: Meters that consume >3000W during prayer periods
+-- Violators: Meters that consume above threshold during prayer periods
 -- Only includes meters with good data quality (>50% non-missing/non-zero readings)
 
-with consumption as (
-    select * from {{ ref('consumption_analysis') }} c
+with source_consumption as (
+    select * from {{ ref('consumption_analysis') }}
+),
+
+{% if is_incremental() %}
+-- Identify which meter/quarter combinations need processing
+source_quarters as (
+    select
+        meter_id,
+        quarter,
+        max_reading_date as source_max_date
+    from source_consumption
+),
+
+target_quarters as (
+    select
+        meter_id,
+        quarter,
+        max_reading_date as target_max_date
+    from {{ this }}
+),
+
+quarters_to_process as (
+    -- Process if: new quarter OR source has newer data than target
+    select s.meter_id, s.quarter
+    from source_quarters s
+    left join target_quarters t
+        on s.meter_id = t.meter_id and s.quarter = t.quarter
+    where t.meter_id IS NULL  -- New meter/quarter combination
+       OR s.source_max_date > t.target_max_date  -- Source has newer data
+),
+{% endif %}
+
+consumption as (
+    select c.*
+    from source_consumption c
     {% if is_incremental() %}
-        -- Only process meters/quarters that are new or have been updated
-        WHERE NOT EXISTS (
-            SELECT 1 FROM {{ this }} t
-            WHERE t.meter_id = c.meter_id 
-              AND t.quarter = c.quarter
-        )
+    where EXISTS (
+        select 1 from quarters_to_process q
+        where c.meter_id = q.meter_id and c.quarter = q.quarter
+    )
     {% endif %}
 ),
 
@@ -63,75 +95,75 @@ flagged as (
 
         -- Over-consumer flags (>3000W threshold)
         CASE
-            WHEN c.morning_avg_consumption * c.multiplication_factor > 3000
+            WHEN c.morning_avg_consumption * c.multiplication_factor > {{ var('violation_threshold_watts') }}
             THEN TRUE
             ELSE FALSE
         END as over_in_morning,
 
         CASE
-            WHEN c.evening_avg_consumption * c.multiplication_factor > 3000
+            WHEN c.evening_avg_consumption * c.multiplication_factor > {{ var('violation_threshold_watts') }}
             THEN TRUE
             ELSE FALSE
         END as over_in_evening,
 
         -- Combined flags
         CASE
-            WHEN c.morning_avg_consumption * c.multiplication_factor > 3000
-                AND c.evening_avg_consumption * c.multiplication_factor > 3000
+            WHEN c.morning_avg_consumption * c.multiplication_factor > {{ var('violation_threshold_watts') }}
+                AND c.evening_avg_consumption * c.multiplication_factor > {{ var('violation_threshold_watts') }}
             THEN TRUE
             ELSE FALSE
         END as over_in_both,
 
         CASE
-            WHEN c.morning_avg_consumption * c.multiplication_factor > 3000
-                OR c.evening_avg_consumption * c.multiplication_factor > 3000
+            WHEN c.morning_avg_consumption * c.multiplication_factor > {{ var('violation_threshold_watts') }}
+                OR c.evening_avg_consumption * c.multiplication_factor > {{ var('violation_threshold_watts') }}
             THEN TRUE
             ELSE FALSE
         END as over_in_either,
 
         -- Violation category
         CASE
-            WHEN c.morning_avg_consumption * c.multiplication_factor > 3000
-                AND c.evening_avg_consumption * c.multiplication_factor > 3000
+            WHEN c.morning_avg_consumption * c.multiplication_factor > {{ var('violation_threshold_watts') }}
+                AND c.evening_avg_consumption * c.multiplication_factor > {{ var('violation_threshold_watts') }}
             THEN 'BOTH_PERIODS'
-            WHEN c.morning_avg_consumption * c.multiplication_factor > 3000
+            WHEN c.morning_avg_consumption * c.multiplication_factor > {{ var('violation_threshold_watts') }}
             THEN 'MORNING_ONLY'
-            WHEN c.evening_avg_consumption * c.multiplication_factor > 3000
+            WHEN c.evening_avg_consumption * c.multiplication_factor > {{ var('violation_threshold_watts') }}
             THEN 'EVENING_ONLY'
             ELSE 'COMPLIANT'
         END as violation_category
 
     from consumption c
-    inner join quality q on c.meter_id = q.meter_id
-    -- Quality filter: only include meters with good data (>50% quality)
+    inner join quality q on c.meter_id = q.meter_id AND c.quarter = q.quarter
+    -- Quality filter: only include meters with good data (>50% quality) for that quarter
     where q.is_good_quality = TRUE
 )
 
 select
     *,
 
-    -- Calculate potential savings if over-consumers reduce to 500W (normal level)
+    -- Calculate potential savings if over-consumers reduce to baseline (normal level)
     CASE
         WHEN over_in_morning = TRUE
-        THEN ROUND(((morning_avg_mf - 500) * morning_reading_count / 2 / 1000) * 0.32, 3)
+        THEN ROUND(((morning_avg_mf - {{ var('baseline_consumption_watts') }}) * morning_reading_count / 2 / 1000) * {{ var('electricity_rate_sar') }}, 3)
         ELSE 0
     END as potential_savings_morning_sar,
 
     CASE
         WHEN over_in_evening = TRUE
-        THEN ROUND(((evening_avg_mf - 500) * evening_reading_count / 2 / 1000) * 0.32, 3)
+        THEN ROUND(((evening_avg_mf - {{ var('baseline_consumption_watts') }}) * evening_reading_count / 2 / 1000) * {{ var('electricity_rate_sar') }}, 3)
         ELSE 0
     END as potential_savings_evening_sar,
 
     -- Total potential savings
     CASE
         WHEN over_in_morning = TRUE
-        THEN ROUND(((morning_avg_mf - 500) * morning_reading_count / 2 / 1000) * 0.32, 3)
+        THEN ROUND(((morning_avg_mf - {{ var('baseline_consumption_watts') }}) * morning_reading_count / 2 / 1000) * {{ var('electricity_rate_sar') }}, 3)
         ELSE 0
     END +
     CASE
         WHEN over_in_evening = TRUE
-        THEN ROUND(((evening_avg_mf - 500) * evening_reading_count / 2 / 1000) * 0.32, 3)
+        THEN ROUND(((evening_avg_mf - {{ var('baseline_consumption_watts') }}) * evening_reading_count / 2 / 1000) * {{ var('electricity_rate_sar') }}, 3)
         ELSE 0
     END as total_potential_savings_sar
 

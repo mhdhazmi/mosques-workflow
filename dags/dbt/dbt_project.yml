@@ -16,6 +16,16 @@ clean-targets:         # directories to be removed by 'dbt clean'
   - "target"
   - "dbt_packages"
 
+vars:
+  # Electricity rate in Saudi Riyals per kWh
+  electricity_rate_sar: 0.32
+  # Threshold for flagging over-consumption during prayer periods (watts)
+  violation_threshold_watts: 3000
+  # Expected baseline consumption for savings calculation (watts)
+  baseline_consumption_watts: 500
+  # Minimum data quality percentage to include meter in analysis
+  quality_threshold_pct: 50
+
 models:
   my_energy_project:
     # Config for all models

@@ -4,6 +4,7 @@ import glob
 import json
 import logging
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from typing import Optional
 
@@ -31,6 +32,13 @@ LOW_MEMORY_MODE = os.getenv("ETL_LOW_MEMORY_MODE", "true").lower() == "true"
 PARQUET_COMPRESSION = os.getenv("PARQUET_COMPRESSION", "snappy")
 ENABLE_ROW_HASH = os.getenv("ETL_ENABLE_ROW_HASH", "true").lower() == "true"
 INFER_SCHEMA_LENGTH = int(os.getenv("ETL_INFER_SCHEMA_LENGTH", "1000"))
+
+# Parallel processing configuration
+ETL_PARALLEL_WORKERS = int(os.getenv("ETL_PARALLEL_WORKERS", "4"))
+ETL_PARALLEL_ENABLED = os.getenv("ETL_PARALLEL_ENABLED", "true").lower() == "true"
+
+# Cache file for successful schema mappings (avoids repeated LLM calls)
+SCHEMA_CACHE_FILE = os.path.join(AIRFLOW_HOME, "include/processed_data/_schema_cache.json")
 
 # The schema we EXPECT to see based on actual data inspection
 EXPECTED_HEADERS = [
@@ -75,6 +83,34 @@ handler.setFormatter(formatter)
 
 if not logger.handlers:
     logger.addHandler(handler)
+
+
+# =========================
+# SCHEMA CACHE FUNCTIONS
+# =========================
+
+def load_schema_cache() -> dict:
+    """Load cached schema mappings from file."""
+    try:
+        if os.path.exists(SCHEMA_CACHE_FILE):
+            with open(SCHEMA_CACHE_FILE, 'r') as f:
+                return json.load(f)
+    except Exception as e:
+        logger.warning(f"Could not load schema cache: {e}")
+    return {}
+
+def save_schema_cache(cache: dict) -> None:
+    """Save schema mappings to cache file."""
+    try:
+        os.makedirs(os.path.dirname(SCHEMA_CACHE_FILE), exist_ok=True)
+        with open(SCHEMA_CACHE_FILE, 'w') as f:
+            json.dump(cache, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Could not save schema cache: {e}")
+
+def get_cache_key(headers: list[str]) -> str:
+    """Generate a cache key from sorted headers."""
+    return "|".join(sorted(h.upper() for h in headers))
 
 
 # =========================
@@ -139,8 +175,16 @@ def get_csv_headers(filepath: str, separator: str | None = None) -> tuple[list[s
 def validate_schema_with_gemini(current_headers: list[str], expected_headers: list[str]) -> dict:
     """
     Asks Gemini to map current headers to expected headers.
+    Uses caching and exponential backoff for quota errors.
     Returns a dict with keys: status, mapping, reason.
     """
+    # Check cache first (use different cache key prefix for validation)
+    cache_key = "validate_" + get_cache_key(current_headers)
+    cache = load_schema_cache()
+    if cache_key in cache:
+        logger.info("Using cached schema validation (skipping LLM call)")
+        return cache[cache_key]
+
     logger.info("Asking Gemini to validate headers with LLM...")
 
     prompt = f"""
@@ -164,26 +208,42 @@ def validate_schema_with_gemini(current_headers: list[str], expected_headers: li
     """
 
     models_to_try = ["gemini-2.5-flash"]
+    # Exponential backoff delays (seconds) for quota/rate limit errors
+    backoff_delays = [30, 60, 120]
 
     for model_name in models_to_try:
-        try:
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(prompt)
-            cleaned_text = (
-                response.text.replace("```json", "").replace("```", "").strip()
-            )
-            result = json.loads(cleaned_text)
-            logger.info("Completed LLM Validation")
-            return result
-        except Exception as e:
-            if "404" in str(e) and "models/" in str(e):
-                logger.warning(
-                    f"Model {model_name} not found or not supported. Trying next..."
+        for attempt, delay in enumerate(backoff_delays + [None]):
+            try:
+                model = genai.GenerativeModel(model_name)
+                response = model.generate_content(prompt)
+                cleaned_text = (
+                    response.text.replace("```json", "").replace("```", "").strip()
                 )
-                continue
-            else:
-                logger.error(f"LLM Validation failed with {model_name}: {e}")
-                continue
+                result = json.loads(cleaned_text)
+                logger.info("Completed LLM Validation")
+
+                # Cache successful validations (MATCH or RENAME, not ABORT)
+                if result.get("status") in ("MATCH", "RENAME"):
+                    cache[cache_key] = result
+                    save_schema_cache(cache)
+                    logger.info("Cached schema validation for future use")
+
+                return result
+
+            except Exception as e:
+                error_str = str(e).lower()
+                is_quota_error = any(x in error_str for x in ["quota", "429", "rate", "resource_exhausted"])
+
+                if "404" in str(e) and "models/" in str(e):
+                    logger.warning(f"Model {model_name} not found or not supported. Trying next...")
+                    break
+                elif is_quota_error and delay is not None:
+                    logger.warning(f"Quota/rate limit hit (attempt {attempt + 1}). Waiting {delay}s before retry...")
+                    time.sleep(delay)
+                    continue
+                else:
+                    logger.error(f"LLM Validation failed with {model_name}: {e}")
+                    break
 
     logger.error("All LLM models failed or are unavailable.")
     return {
@@ -196,8 +256,16 @@ def validate_schema_with_gemini(current_headers: list[str], expected_headers: li
 def map_important_columns_with_gemini(current_headers: list[str], important_columns: list[str]) -> dict:
     """
     Asks Gemini to map current headers to important columns only using structured output.
+    Uses caching to avoid repeated API calls and exponential backoff for quota errors.
     Returns a dict with keys: status, mapping, reason.
     """
+    # Check cache first
+    cache_key = get_cache_key(current_headers)
+    cache = load_schema_cache()
+    if cache_key in cache:
+        logger.info("Using cached schema mapping (skipping LLM call)")
+        return cache[cache_key]
+
     logger.info("Asking Gemini to map important columns with LLM (structured output)...")
 
     prompt = f"""
@@ -213,15 +281,14 @@ def map_important_columns_with_gemini(current_headers: list[str], important_colu
     3. Return the column_mappings array with each mapping having incoming_column (exactly as it appears in CSV) and target_column (the important column name).
     4. Only map columns that you are confident match. Do not force mappings.
     5. If you cannot find matches for all important columns, still return the mappings you found.
-    
+
     Status meanings:
     - "SUCCESS": All important columns were mapped
-    - "PARTIAL": Some important columns were mapped  
+    - "PARTIAL": Some important columns were mapped
     - "FAILED": No important columns could be mapped
     """
 
     # Define the response schema for structured output
-    # Using array of objects since Gemini doesn't support additionalProperties
     response_schema = {
         "type": "object",
         "properties": {
@@ -248,43 +315,60 @@ def map_important_columns_with_gemini(current_headers: list[str], important_colu
     }
 
     models_to_try = ["gemini-2.0-flash"]
+    # Exponential backoff delays (seconds) for quota/rate limit errors
+    backoff_delays = [30, 60, 120]
 
     for model_name in models_to_try:
-        try:
-            model = genai.GenerativeModel(
-                model_name,
-                generation_config={
-                    "response_mime_type": "application/json",
-                    "response_schema": response_schema,
-                }
-            )
-            response = model.generate_content(prompt)
-            result = json.loads(response.text)
-            logger.info("Completed LLM Important Columns Mapping")
-            logger.info(f"LLM structured response: {json.dumps(result)}")
-            
-            # Convert column_mappings array to mapping dict for compatibility
-            mapping = {}
-            for item in result.get("column_mappings", []):
-                incoming = item.get("incoming_column")
-                target = item.get("target_column")
-                if incoming and target:
-                    mapping[incoming] = target
-            
-            return {
-                "status": result.get("status", "FAILED"),
-                "mapping": mapping,
-                "reason": result.get("reason", "No reason provided"),
-            }
-        except Exception as e:
-            if "404" in str(e) and "models/" in str(e):
-                logger.warning(
-                    f"Model {model_name} not found or not supported. Trying next..."
+        for attempt, delay in enumerate(backoff_delays + [None]):  # None = final attempt
+            try:
+                model = genai.GenerativeModel(
+                    model_name,
+                    generation_config={
+                        "response_mime_type": "application/json",
+                        "response_schema": response_schema,
+                    }
                 )
-                continue
-            else:
-                logger.error(f"LLM Important Columns Mapping failed with {model_name}: {e}")
-                continue
+                response = model.generate_content(prompt)
+                result = json.loads(response.text)
+                logger.info("Completed LLM Important Columns Mapping")
+                logger.info(f"LLM structured response: {json.dumps(result)}")
+
+                # Convert column_mappings array to mapping dict for compatibility
+                mapping = {}
+                for item in result.get("column_mappings", []):
+                    incoming = item.get("incoming_column")
+                    target = item.get("target_column")
+                    if incoming and target:
+                        mapping[incoming] = target
+
+                result_dict = {
+                    "status": result.get("status", "FAILED"),
+                    "mapping": mapping,
+                    "reason": result.get("reason", "No reason provided"),
+                }
+
+                # Cache successful mappings
+                if result_dict["status"] in ("SUCCESS", "PARTIAL") and mapping:
+                    cache[cache_key] = result_dict
+                    save_schema_cache(cache)
+                    logger.info("Cached schema mapping for future use")
+
+                return result_dict
+
+            except Exception as e:
+                error_str = str(e).lower()
+                is_quota_error = any(x in error_str for x in ["quota", "429", "rate", "resource_exhausted"])
+
+                if "404" in str(e) and "models/" in str(e):
+                    logger.warning(f"Model {model_name} not found or not supported. Trying next...")
+                    break  # Move to next model
+                elif is_quota_error and delay is not None:
+                    logger.warning(f"Quota/rate limit hit (attempt {attempt + 1}). Waiting {delay}s before retry...")
+                    time.sleep(delay)
+                    continue
+                else:
+                    logger.error(f"LLM Important Columns Mapping failed with {model_name}: {e}")
+                    break  # Move to next model
 
     logger.error("All LLM models failed or are unavailable.")
     return {
@@ -512,7 +596,9 @@ def get_file_quarter(input_path: str, col_mapping: dict = None, separator: str =
                     break
 
         if data_time_col and data_time_col in df.columns:
-            date_val = datetime.strptime(df[data_time_col][0], "%Y-%m-%d %H:%M:%S")
+            # Strip microseconds if present (e.g., "2025-04-01 00:00:00.0000000" -> "2025-04-01 00:00:00")
+            date_str = str(df[data_time_col][0]).split('.')[0]
+            date_val = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
             quarter = (date_val.month - 1) // 3 + 1
             logger.info("Completed Determining File Quarter")
             return f"{date_val.year}-Q{quarter}"
@@ -830,15 +916,54 @@ def process_file_streaming(
 STATS_OUTPUT_PATH = os.path.join(OUTPUT_DIR, "_etl_stats.json")
 
 
+def process_single_file(args: tuple) -> tuple[bool, Optional[dict], str]:
+    """
+    Worker function for parallel file processing.
+    Returns (success, stats_dict, filename) tuple.
+    """
+    input_file, output_dir, run_id = args
+    filename = os.path.basename(input_file)
+
+    try:
+        # 1. Read Headers (auto-detects separator)
+        current_headers, separator = get_csv_headers(input_file)
+        if not current_headers:
+            logger.error(f"Skipping {filename} due to missing/invalid headers.")
+            return (False, None, filename)
+
+        # 2. Validate schema (deterministic first, then LLM)
+        schema_result = determine_schema_mapping(current_headers, EXPECTED_HEADERS)
+
+        logger.info(
+            f"Schema analysis for {filename}: "
+            f"{schema_result.get('reason', 'No reason provided')}"
+        )
+
+        mapping = schema_result.get("mapping", {})
+        important_only = schema_result.get("important_only", False)
+
+        # 3. Process file with streaming pipeline
+        success, stats = process_file_streaming(
+            input_file, output_dir, mapping, important_only, separator, run_id
+        )
+
+        stats_dict = stats.to_bq_row() if stats else None
+        return (success, stats_dict, filename)
+
+    except Exception as e:
+        logger.error(f"Error processing {filename}: {e}")
+        return (False, None, filename)
+
+
 def main() -> int:
     """
     Main ETL orchestration function.
-    Processes CSV files, collects stats, and saves them for downstream tasks.
+    Processes CSV files in parallel, collects stats, and saves them for downstream tasks.
     """
     # Get run ID from environment (set by Airflow DAG) or generate one
     run_id = get_run_id()
     logger.info(f"Starting ETL with run_id: {run_id}")
-    
+
     # Ensure directories exist
     if not os.path.exists(INPUT_DIR):
         os.makedirs(INPUT_DIR, exist_ok=True)
@@ -856,59 +981,70 @@ def main() -> int:
         return 0
 
     logger.info(f"Found {len(input_files)} files to process.")
-    
+
     # Collect stats for all files
-    all_stats: list[StageStats] = []
+    all_stats: list[dict] = []
+    failed_files: list[str] = []
 
-    for input_file in input_files:
-        filename = os.path.basename(input_file)
-        logger.info(f"Processing {filename}...")
+    if ETL_PARALLEL_ENABLED and len(input_files) > 1:
+        # Parallel processing
+        workers = min(ETL_PARALLEL_WORKERS, len(input_files))
+        logger.info(f"Processing files in parallel with {workers} workers...")
 
-        # 1. Read Headers (auto-detects separator)
-        current_headers, separator = get_csv_headers(input_file)
-        if not current_headers:
-            logger.error(f"Skipping {filename} due to missing/invalid headers.")
-            continue
+        # Prepare arguments for each file
+        file_args = [(f, OUTPUT_DIR, run_id) for f in input_files]
 
-        # 2. Validate schema (deterministic first, then LLM)
-        try:
-            schema_result = determine_schema_mapping(current_headers, EXPECTED_HEADERS)
-        except Exception as e:
-            logger.error(f"Schema validation failed for {filename}: {e}")
-            # Fail fast so Airflow marks the task as failed
-            return 1
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(process_single_file, args): args[0] for args in file_args}
 
-        logger.info(
-            f"Schema analysis for {filename}: "
-            f"{schema_result.get('reason', 'No reason provided')}"
-        )
+            for future in as_completed(futures):
+                input_file = futures[future]
+                filename = os.path.basename(input_file)
 
-        mapping = schema_result.get("mapping", {})
-        important_only = schema_result.get("important_only", False)
-
-        # 3. Process file with streaming pipeline
-        success, stats = process_file_streaming(
-            input_file, OUTPUT_DIR, mapping, important_only, separator, run_id
-        )
-        
-        if stats:
-            all_stats.append(stats)
-        
-        if not success:
-            logger.error(f"ETL failed for {filename}. Aborting run.")
-            # Save stats even on failure for debugging
-            _save_stats_to_file(all_stats)
-            return 1
+                try:
+                    success, stats_dict, _ = future.result()
+                    if stats_dict:
+                        all_stats.append(stats_dict)
+                    if not success:
+                        failed_files.append(filename)
+                        logger.error(f"ETL failed for {filename}")
+                except Exception as e:
+                    failed_files.append(filename)
+                    logger.error(f"Exception processing {filename}: {e}")
+    else:
+        # Sequential processing (original behavior)
+        logger.info("Processing files sequentially...")
+        for input_file in input_files:
+            success, stats_dict, filename = process_single_file((input_file, OUTPUT_DIR, run_id))
+            if stats_dict:
+                all_stats.append(stats_dict)
+            if not success:
+                failed_files.append(filename)
+                logger.error(f"ETL failed for {filename}")
 
     # Save stats to JSON file for cloud_loader to read
-    _save_stats_to_file(all_stats)
-    
+    _save_stats_to_file_dict(all_stats)
+
+    if failed_files:
+        logger.error(f"ETL failed for {len(failed_files)} files: {failed_files}")
+        return 1
+
     logger.info("All files processed successfully.")
     return 0
 
 
+def _save_stats_to_file_dict(stats_list: list[dict]) -> None:
+    """Save stats dicts to a JSON file for the cloud_loader to read."""
+    try:
+        with open(STATS_OUTPUT_PATH, "w") as f:
+            json.dump(stats_list, f, indent=2, default=str)
+        logger.info(f"Saved {len(stats_list)} ETL stats records to {STATS_OUTPUT_PATH}")
+    except Exception as e:
+        logger.error(f"Failed to save stats to file: {e}")
+
+
 def _save_stats_to_file(stats_list: list[StageStats]) -> None:
-    """Save stats to a JSON file for the cloud_loader to read."""
+    """Save stats to a JSON file for the cloud_loader to read (legacy, uses StageStats objects)."""
     try:
         stats_data = [s.to_bq_row() for s in stats_list]
         with open(STATS_OUTPUT_PATH, "w") as f:

@@ -2,19 +2,22 @@
     materialized='view'
 ) }}
 
--- Calculate data quality score for each meter
+-- Calculate data quality score for each meter PER QUARTER
 -- Quality = (actual_readings - zero_readings) / expected_readings * 100
 -- Expected readings = 48 per day (30-minute intervals)
+-- Partitioned by quarter so quality assessment matches consumption_analysis granularity
 
 with meter_stats as (
     select
         meter_id,
+        quarter,
         MIN(reading_date) as min_date,
         MAX(reading_date) as max_date,
-        DATE_DIFF(MAX(reading_date), MIN(reading_date), DAY) as date_range_days,
+        DATE_DIFF(MAX(reading_date), MIN(reading_date), DAY) + 1 as date_range_days,
 
         -- Expected readings: 48 per day (30-min intervals)
-        DATE_DIFF(MAX(reading_date), MIN(reading_date), DAY) * 48 as expected_readings,
+        -- +1 to include both start and end dates (inclusive range)
+        (DATE_DIFF(MAX(reading_date), MIN(reading_date), DAY) + 1) * 48 as expected_readings,
 
         -- Actual readings count
         COUNT(*) as actual_readings,
@@ -27,11 +30,12 @@ with meter_stats as (
 
     -- Use int_exclude_ramadan to filter out Ramadan dates when configured
     from {{ ref('int_exclude_ramadan') }}
-    group by meter_id
+    group by meter_id, quarter
 )
 
 select
     meter_id,
+    quarter,
     min_date,
     max_date,
     date_range_days,
@@ -50,10 +54,10 @@ select
         ELSE 0
     END as quality_percentage,
 
-    -- Quality flag (good if >= 50%)
+    -- Quality flag (good if >= threshold %)
     CASE
         WHEN expected_readings > 0
-            AND (actual_readings - zero_readings) / CAST(expected_readings AS FLOAT64) * 100 >= 50
+            AND (actual_readings - zero_readings) / CAST(expected_readings AS FLOAT64) * 100 >= {{ var('quality_threshold_pct') }}
         THEN TRUE
         ELSE FALSE
     END as is_good_quality

@@ -5,10 +5,10 @@ models:
     description: "Aggregated consumption analysis per meter with morning/evening period breakdowns"
     columns:
       - name: meter_id
-        description: "Unique identifier for the smart meter"
+        description: "Unique identifier for the smart meter (combined with quarter for uniqueness)"
         tests:
           - not_null
-          - unique
+      # Note: uniqueness is now on (meter_id, quarter) composite key - enforced by model config
       - name: total_avg_consumption
         description: "Average consumption across all readings"
       - name: morning_avg_consumption

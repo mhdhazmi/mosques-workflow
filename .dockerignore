@@ -29,6 +29,7 @@ infra/*.tfstate*
 # --- Data ---
 data/
 include/raw_data/
+include/raw_data_backup/
 include/processed_data/
 
 # --- dbt ---

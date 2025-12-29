@@ -136,6 +136,8 @@ def create_features(df):
 
 **Feature Importance** (Expected):
 
+![Feature Importance](images/feature_importance.png)
+
 | Feature | Importance | Rationale |
 |---------|------------|-----------|
 | `friday_consumption_ratio` | 0.35 | Strongest mosque indicator |
@@ -230,6 +232,8 @@ print(f"Mean F1: {cv_scores.mean():.4f} (+/- {cv_scores.std() * 2:.4f})")
 ```
 
 **Cross-Validation Results** (Hypothetical):
+
+![Cross-Validation Scores](images/cv_scores.png)
 
 | Fold | F1 Score |
 |------|----------|

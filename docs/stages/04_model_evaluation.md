@@ -54,6 +54,8 @@ weighted avg     0.942     0.942     0.942      4200
 
 **Mosque Classifier Confusion Matrix** (Hypothetical):
 
+![Confusion Matrix](images/confusion_matrix.png)
+
 ```
                     Predicted
                  Non-Mosque  Mosque
@@ -154,6 +156,8 @@ END
 
 #### Regional Distribution Analysis
 
+![Regional Distribution](images/regional_distribution.png)
+
 **Violator Distribution by Region**:
 
 | Region | Total Meters | Violators | Rate | Status |
@@ -206,6 +210,8 @@ ORDER BY quality_pass_rate;
 ---
 
 ## ROC Curve Analysis (Classifier)
+
+![ROC Curve](images/roc_curve.png)
 
 **ROC-AUC Score**: 0.97 (Hypothetical)
 

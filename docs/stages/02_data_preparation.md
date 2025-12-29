@@ -78,6 +78,10 @@ FROM raw_meter_readings.smart_meters_clean
 GROUP BY 1;
 ```
 
+### Data Quality Visualization
+
+![Data Quality Before/After](images/data_quality.png)
+
 ### 2.3 Data Cleaning
 
 **Cleaning Pipeline** (`etl_processor.py`):
@@ -155,6 +159,8 @@ evening_end_time = TIME_SUB(fajr_time, INTERVAL 80 MINUTE)
 | Training | 70% | ~19,600 | Model training |
 | Validation | 15% | ~4,200 | Hyperparameter tuning |
 | Test | 15% | ~4,200 | Final evaluation |
+
+![Data Split](images/data_split.png)
 
 **Splitting Strategy**:
 ```python

@@ -66,6 +66,8 @@ def daily_accuracy_check():
 
 ### 7.2 Monthly Review
 
+![Monthly Trend](images/monthly_trend.png)
+
 **Monthly Metrics Report**:
 
 | Metric | Target | Review Criteria |

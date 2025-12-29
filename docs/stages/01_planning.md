@@ -126,6 +126,12 @@ For demonstrating the ML lifecycle, we include a binary classifier to identify w
 
 ---
 
+## Pipeline Architecture
+
+![Pipeline Architecture](images/pipeline_architecture.png)
+
+---
+
 ## Appendix: Project Configuration
 
 ### Threshold Configuration (`dbt_project.yml`)

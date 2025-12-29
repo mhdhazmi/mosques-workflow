@@ -50,6 +50,53 @@ weighted avg     0.942     0.942     0.942      4200
 | 2025-Q2 | 29,222 | 11,563 | 39.6% |
 | 2025-Q3 | 28,622 | 13,923 | 48.6% |
 
+#### Normal Consumption Benchmarks
+
+Analysis of 28,228 compliant (non-violator) meter-quarter records with good data quality (>50%):
+
+**Consumption Percentiles** (with multiplication factor applied):
+
+| Percentile | Morning (W) | Evening (W) | Description |
+|------------|-------------|-------------|-------------|
+| P10 | 123 | 184 | Low consumers |
+| P25 | 317 | 408 | First quartile |
+| **P50 (Median)** | **764** | **894** | Typical consumption |
+| P75 | 1,528 | 1,701 | Third quartile |
+| P90 | 2,204 | 2,382 | High (but compliant) |
+
+**Key Findings**:
+- Median consumption: 764W morning, 894W evening (17% higher in evening)
+- Typical range (IQR): 317-1,528W morning, 408-1,701W evening
+- P90 is well below 3000W threshold, validating the violation threshold
+- 9x gap between normal median (~800W) and violator average (~9,000W)
+
+#### Classification Tier Distribution
+
+Based on `meter_classification.sql` model:
+
+| Tier | Criteria | Expected Distribution |
+|------|----------|----------------------|
+| EFFICIENT | ≤ P25 | ~25% of meters |
+| NORMAL_LOW | P25 < x ≤ P50 | ~25% of meters |
+| NORMAL_HIGH | P50 < x ≤ P75 | ~25% of meters |
+| ELEVATED | P75 < x ≤ P90 | ~15% of meters |
+| HIGH | P90 < x ≤ 3000W | ~5% of meters |
+| VIOLATOR | > 3000W | ~47% of total |
+
+#### Efficiency Score Distribution
+
+Based on `meter_efficiency_score.sql` model:
+
+| Grade | Score Range | Description |
+|-------|-------------|-------------|
+| A+ | 95-100 | Exemplary efficiency |
+| A | 85-94 | Excellent |
+| B | 70-84 | Good |
+| C | 50-69 | Average |
+| D | 30-49 | Below average |
+| E | 15-29 | Poor |
+| F | 0-14 | Critical - needs attention |
+
 ### 4.2 Confusion Matrix Analysis
 
 **Mosque Classifier Confusion Matrix** (Hypothetical):

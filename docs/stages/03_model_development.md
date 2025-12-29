@@ -147,7 +147,122 @@ def create_features(df):
 | `evening_to_morning_ratio` | 0.08 | Pattern characteristic |
 | `weekend_pattern` | 0.07 | No weekend drop-off |
 
-### 3.4 Model Selection
+### 3.4 Advanced Analytics Models (dbt)
+
+In addition to the core consumption analysis, the pipeline includes five advanced analytics models that provide deeper insights into consumption patterns:
+
+#### 3.4.1 Consumption Benchmarks (`consumption_benchmarks.sql`)
+
+**Purpose**: Calculate percentile statistics for compliant (non-violator) meters to establish baseline consumption patterns.
+
+```sql
+-- Calculates benchmarks at 4 aggregation levels
+-- Levels: overall, regional, quarterly, size_based
+-- Uses APPROX_QUANTILES for efficient percentile calculation
+
+SELECT
+    benchmark_level,
+    benchmark_key,
+    COUNT(*) as meter_count,
+    AVG(consumption_mf) as avg_consumption,
+    APPROX_QUANTILES(consumption_mf, 100)[OFFSET(10)] as p10,
+    APPROX_QUANTILES(consumption_mf, 100)[OFFSET(25)] as p25,
+    APPROX_QUANTILES(consumption_mf, 100)[OFFSET(50)] as p50,  -- Median
+    APPROX_QUANTILES(consumption_mf, 100)[OFFSET(75)] as p75,
+    APPROX_QUANTILES(consumption_mf, 100)[OFFSET(90)] as p90
+FROM compliant_meters
+GROUP BY benchmark_level, benchmark_key
+```
+
+**Key Statistics** (from analysis):
+| Period | P25 | P50 (Median) | P75 | P90 |
+|--------|-----|--------------|-----|-----|
+| Morning | 317W | 764W | 1,528W | 2,204W |
+| Evening | 408W | 894W | 1,701W | 2,382W |
+
+#### 3.4.2 Meter Classification (`meter_classification.sql`)
+
+**Purpose**: Assign each meter to one of six consumption tiers based on benchmark percentiles.
+
+```sql
+-- 6-tier classification system
+CASE
+    WHEN consumption_avg_mf <= p25 THEN 'EFFICIENT'      -- Best performers
+    WHEN consumption_avg_mf <= p50 THEN 'NORMAL_LOW'     -- Below median
+    WHEN consumption_avg_mf <= p75 THEN 'NORMAL_HIGH'    -- Above median
+    WHEN consumption_avg_mf <= p90 THEN 'ELEVATED'       -- Warning zone
+    WHEN consumption_avg_mf <= 3000 THEN 'HIGH'          -- Near threshold
+    ELSE 'VIOLATOR'                                       -- Over threshold
+END as consumption_tier
+```
+
+**Output**: `morning_tier`, `evening_tier`, `overall_tier`, `tier_rank`, `is_violator`, `needs_attention`
+
+#### 3.4.3 Meter Percentile Rank (`meter_percentile_rank.sql`)
+
+**Purpose**: Show each meter's relative position compared to all meters.
+
+```sql
+-- PERCENT_RANK window function for ranking
+SELECT
+    meter_id,
+    quarter,
+    ROUND(PERCENT_RANK() OVER (ORDER BY morning_avg_mf) * 100, 1) as morning_percentile,
+    ROUND(PERCENT_RANK() OVER (ORDER BY evening_avg_mf) * 100, 1) as evening_percentile,
+    ROUND(PERCENT_RANK() OVER (ORDER BY total_avg_mf) * 100, 1) as overall_percentile
+FROM consumption_analysis
+```
+
+**Interpretation**: "This mosque is in the 73rd percentile (consumes more than 73% of mosques)"
+
+#### 3.4.4 Meter Consumption Trend (`meter_consumption_trend.sql`)
+
+**Purpose**: Track quarter-over-quarter consumption changes and detect anomalies.
+
+```sql
+-- LAG() function for Q-o-Q comparison
+SELECT
+    meter_id,
+    quarter,
+    total_avg_consumption as current_consumption,
+    LAG(total_avg_consumption) OVER (PARTITION BY meter_id ORDER BY quarter) as prev_consumption,
+    CASE
+        WHEN change_pct > 50 THEN 'SPIKE'          -- Alert: >50% increase
+        WHEN change_pct > 10 THEN 'INCREASING'
+        WHEN change_pct BETWEEN -10 AND 10 THEN 'STABLE'
+        WHEN change_pct < -30 THEN 'DROP'          -- Investigate
+        ELSE 'DECREASING'
+    END as trend_category
+FROM consumption_with_lag
+```
+
+**Trend Categories**: `FIRST_QUARTER`, `SPIKE`, `INCREASING`, `STABLE`, `DECREASING`, `DROP`
+
+#### 3.4.5 Meter Efficiency Score (`meter_efficiency_score.sql`)
+
+**Purpose**: Generate a 0-100 efficiency score with letter grades for each meter.
+
+```sql
+-- Inverse percentile scoring (lower consumption = higher score)
+efficiency_score = ROUND(100 * (1 - PERCENT_RANK() OVER (ORDER BY total_avg_mf)), 1)
+
+-- Letter grade assignment
+CASE
+    WHEN efficiency_score >= 95 THEN 'A+'
+    WHEN efficiency_score >= 85 THEN 'A'
+    WHEN efficiency_score >= 70 THEN 'B'
+    WHEN efficiency_score >= 50 THEN 'C'
+    WHEN efficiency_score >= 30 THEN 'D'
+    WHEN efficiency_score >= 15 THEN 'E'
+    ELSE 'F'
+END as efficiency_grade
+```
+
+**Grade Distribution**: 100 = Most efficient (lowest consumption), 0 = Least efficient (highest consumption)
+
+---
+
+### 3.5 Model Selection
 
 **Analytics Pipeline**: dbt incremental models with SQL-based analytics
 
@@ -177,7 +292,7 @@ model.fit(X_train, y_train)
 | Overfitting Risk | Low | Low | Medium |
 | **Selected** | **Yes** | No | No |
 
-### 3.5 Hyperparameter Tuning
+### 3.6 Hyperparameter Tuning
 
 **Grid Search Configuration**:
 
@@ -212,7 +327,7 @@ best_params = grid_search.best_params_
 | min_samples_split | 5 |
 | min_samples_leaf | 2 |
 
-### 3.6 Training and Cross-Validation
+### 3.7 Training and Cross-Validation
 
 **Stratified K-Fold Cross-Validation**:
 
@@ -244,7 +359,7 @@ print(f"Mean F1: {cv_scores.mean():.4f} (+/- {cv_scores.std() * 2:.4f})")
 | 5 | 0.939 |
 | **Mean** | **0.939 +/- 0.010** |
 
-### 3.7 Experiment Tracking
+### 3.8 Experiment Tracking
 
 **Experiment Log**:
 

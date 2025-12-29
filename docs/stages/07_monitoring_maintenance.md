@@ -105,6 +105,74 @@ GROUP BY quarter
 ORDER BY quarter DESC;
 ```
 
+#### Advanced Analytics Model Monitoring
+
+**Efficiency Score Distribution**:
+```sql
+-- Monitor efficiency grade distribution
+SELECT
+    quarter,
+    efficiency_grade,
+    COUNT(*) as meter_count,
+    ROUND(AVG(efficiency_score), 1) as avg_score
+FROM `raw_meter_readings.meter_efficiency_score`
+GROUP BY quarter, efficiency_grade
+ORDER BY quarter DESC, efficiency_grade;
+```
+
+**Classification Tier Trends**:
+```sql
+-- Monitor classification tier distribution over time
+SELECT
+    quarter,
+    overall_tier,
+    COUNT(*) as meter_count,
+    ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (PARTITION BY quarter), 1) as pct_of_total
+FROM `raw_meter_readings.meter_classification`
+GROUP BY quarter, overall_tier
+ORDER BY quarter DESC,
+    CASE overall_tier
+        WHEN 'EFFICIENT' THEN 1
+        WHEN 'NORMAL_LOW' THEN 2
+        WHEN 'NORMAL_HIGH' THEN 3
+        WHEN 'ELEVATED' THEN 4
+        WHEN 'HIGH' THEN 5
+        WHEN 'VIOLATOR' THEN 6
+    END;
+```
+
+**Consumption Trend Alerts**:
+```sql
+-- Identify meters with concerning trends (SPIKE or DROP)
+SELECT
+    meter_id,
+    quarter,
+    trend_category,
+    current_consumption,
+    previous_consumption,
+    change_percentage
+FROM `raw_meter_readings.meter_consumption_trend`
+WHERE trend_category IN ('SPIKE', 'DROP')
+ORDER BY ABS(change_percentage) DESC
+LIMIT 100;
+```
+
+**Benchmark Drift Detection**:
+```sql
+-- Compare current benchmarks to historical baselines
+SELECT
+    benchmark_level,
+    benchmark_key,
+    morning_p50,
+    evening_p50,
+    -- Compare to expected values (Morning: 764W, Evening: 894W)
+    ROUND((morning_p50 - 764) / 764 * 100, 1) as morning_drift_pct,
+    ROUND((evening_p50 - 894) / 894 * 100, 1) as evening_drift_pct
+FROM `raw_meter_readings.consumption_benchmarks`
+WHERE benchmark_level = 'overall'
+ORDER BY benchmark_key DESC;
+```
+
 **Model Performance Drift**:
 ```python
 def monthly_drift_analysis():
@@ -410,6 +478,10 @@ ORDER BY total_savings_sar DESC;
 - [ ] Check model drift metrics
 - [ ] Review regional distribution
 - [ ] Update stakeholders
+- [ ] Review efficiency score distribution
+- [ ] Check classification tier trends
+- [ ] Monitor consumption trend alerts (SPIKE/DROP)
+- [ ] Verify benchmark stability
 
 ### Quarterly
 - [ ] Full model retraining (classifier)

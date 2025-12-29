@@ -19,3 +19,139 @@ models:
         description: "Total energy consumption in kWh"
       - name: data_quality_flag
         description: "Data quality indicator: COMPLETE, NO_MORNING_DATA, NO_EVENING_DATA, or NO_PERIOD_DATA"
+
+  - name: consumption_benchmarks
+    description: "Statistical benchmarks for normal mosque consumption patterns (excludes violators)"
+    columns:
+      - name: benchmark_level
+        description: "Level of aggregation: overall, regional, quarterly, size_based"
+      - name: benchmark_key
+        description: "Key value for the level (e.g., region name, quarter, MF value)"
+      - name: meter_count
+        description: "Number of compliant meters in this benchmark group"
+      - name: morning_p50
+        description: "Median morning consumption (watts with MF)"
+      - name: evening_p50
+        description: "Median evening consumption (watts with MF)"
+      - name: morning_iqr
+        description: "Interquartile range for morning consumption (P75 - P25)"
+      - name: evening_iqr
+        description: "Interquartile range for evening consumption (P75 - P25)"
+
+  - name: meter_classification
+    description: "6-tier consumption classification for each meter based on benchmark percentiles"
+    columns:
+      - name: meter_id
+        description: "Unique identifier for the smart meter"
+        tests:
+          - not_null
+      - name: quarter
+        description: "Quarter identifier (YYYY-QN format)"
+      - name: morning_tier
+        description: "Classification tier for morning consumption"
+      - name: evening_tier
+        description: "Classification tier for evening consumption"
+      - name: overall_tier
+        description: "Overall classification: EFFICIENT, NORMAL_LOW, NORMAL_HIGH, ELEVATED, HIGH, VIOLATOR"
+      - name: tier_rank
+        description: "Numeric tier for sorting (1=best, 6=worst)"
+      - name: is_violator
+        description: "Boolean flag if meter exceeds violation threshold"
+      - name: needs_attention
+        description: "Boolean flag if meter is ELEVATED or worse"
+
+  - name: meter_percentile_rank
+    description: "Percentile ranking for each meter showing position relative to all meters"
+    columns:
+      - name: meter_id
+        description: "Unique identifier for the smart meter"
+        tests:
+          - not_null
+      - name: quarter
+        description: "Quarter identifier (YYYY-QN format)"
+      - name: morning_percentile
+        description: "Morning consumption percentile (0-100, higher = more consumption)"
+      - name: evening_percentile
+        description: "Evening consumption percentile (0-100, higher = more consumption)"
+      - name: total_percentile
+        description: "Total consumption percentile (0-100, higher = more consumption)"
+      - name: regional_percentile
+        description: "Percentile within the meter's region"
+      - name: morning_diff_from_median
+        description: "Watts above/below the median for morning period"
+      - name: evening_diff_from_median
+        description: "Watts above/below the median for evening period"
+      - name: consumption_position
+        description: "Human-readable position description"
+
+  - name: meter_consumption_trend
+    description: "Quarter-over-quarter consumption trend analysis for each meter"
+    columns:
+      - name: meter_id
+        description: "Unique identifier for the smart meter"
+        tests:
+          - not_null
+      - name: quarter
+        description: "Quarter identifier (YYYY-QN format)"
+      - name: prev_quarter
+        description: "Previous quarter identifier"
+      - name: morning_pct_change
+        description: "Percentage change in morning consumption from previous quarter"
+      - name: evening_pct_change
+        description: "Percentage change in evening consumption from previous quarter"
+      - name: overall_trend
+        description: "Trend direction: FIRST_QUARTER, SPIKE, INCREASING, STABLE, DECREASING, DROP"
+      - name: has_spike
+        description: "Boolean flag if consumption increased >50%"
+      - name: has_drop
+        description: "Boolean flag if consumption decreased >50%"
+      - name: change_hint
+        description: "Possible cause hint for significant changes"
+
+  - name: meter_efficiency_score
+    description: "Efficiency score (0-100) for each meter, higher = more efficient"
+    columns:
+      - name: meter_id
+        description: "Unique identifier for the smart meter"
+        tests:
+          - not_null
+      - name: quarter
+        description: "Quarter identifier (YYYY-QN format)"
+      - name: morning_efficiency_score
+        description: "Efficiency score for morning period (0-100)"
+      - name: evening_efficiency_score
+        description: "Efficiency score for evening period (0-100)"
+      - name: combined_efficiency_score
+        description: "Average of morning and evening efficiency scores"
+      - name: regional_efficiency_score
+        description: "Efficiency score relative to regional peers"
+      - name: efficiency_grade
+        description: "Letter grade: A+, A, B, C, D, E, F"
+      - name: is_efficient
+        description: "Boolean flag if in top 25%"
+      - name: is_inefficient
+        description: "Boolean flag if in bottom 25%"
+      - name: estimated_monthly_savings_if_at_median_sar
+        description: "Estimated SAR savings if consumption reduced to median"
+
+  - name: violators
+    description: "Meters that consume above threshold during prayer periods with root cause analysis"
+    columns:
+      - name: meter_id
+        description: "Unique identifier for the smart meter"
+        tests:
+          - not_null
+      - name: quarter
+        description: "Quarter identifier (YYYY-QN format)"
+      - name: violation_category
+        description: "Type of violation: BOTH_PERIODS, MORNING_ONLY, EVENING_ONLY"
+      - name: probable_cause
+        description: "Root cause hint: LARGE_FACILITY_HIGH_LOAD, OVERNIGHT_USAGE, CONTINUOUS_OVERCONSUMPTION, SEASONAL_COOLING, DAYTIME_OVERCONSUMPTION, EVENING_OVERCONSUMPTION, INVESTIGATION_NEEDED"
+      - name: benchmark_morning_median
+        description: "Reference median for morning consumption (from benchmarks)"
+      - name: benchmark_evening_median
+        description: "Reference median for evening consumption (from benchmarks)"
+      - name: total_potential_savings_sar
+        description: "Potential savings using benchmark-based calculation (SAR)"
+      - name: legacy_potential_savings_sar
+        description: "Potential savings using fixed baseline calculation (SAR)"

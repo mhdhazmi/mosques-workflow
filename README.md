@@ -11,9 +11,10 @@ This guide provides a complete end-to-end walkthrough for setting up, configurin
 - [Running the Pipeline](#6-running-the-pipeline)
 - [Pipeline Architecture](#7-pipeline-architecture--data-flow)
 - [dbt Models Documentation](#8-dbt-models-documentation)
-- [Violator Analysis](#9-violator-analysis)
-- [Pipeline Statistics](#10-pipeline-statistics)
-- [Troubleshooting](#11-troubleshooting)
+- [Normal Consumption Pattern Analysis](#9-normal-consumption-pattern-analysis)
+- [Violator Analysis](#10-violator-analysis)
+- [Pipeline Statistics](#11-pipeline-statistics)
+- [Troubleshooting](#12-troubleshooting)
 
 ---
 
@@ -262,7 +263,12 @@ Seeds are CSV files in `dags/dbt/seeds/` that contain static reference data. The
 ┌─────────────────────────────────────────────────────────┐
 │              Analytics Tables (Marts)                    │
 │  - consumption_analysis (consumption metrics, incr.)    │
-│  - violators (over-consumers >3000W, incremental)       │
+│  - consumption_benchmarks (percentile statistics)       │
+│  - meter_classification (6-tier classification)         │
+│  - meter_percentile_rank (per-meter ranking)           │
+│  - meter_consumption_trend (Q-o-Q trends)              │
+│  - meter_efficiency_score (0-100 efficiency scores)    │
+│  - violators (over-consumers >3000W + root cause)      │
 │  - consumption_riyadh (Riyadh regional analysis)        │
 │  - violators_riyadh (Riyadh over-consumer report)       │
 │  - riyadh_quarter_report (summary with team comparison) │
@@ -347,7 +353,12 @@ Intermediate Layer (int_*)
 
 Marts Layer
 ├── consumption_analysis     ← Final aggregated metrics (incremental)
-├── violators                ← Meters exceeding 3000W threshold (incremental)
+├── consumption_benchmarks   ← Percentile statistics for normal meters
+├── meter_classification     ← 6-tier classification (EFFICIENT → VIOLATOR)
+├── meter_percentile_rank    ← Per-meter percentile ranking
+├── meter_consumption_trend  ← Quarter-over-quarter trend analysis
+├── meter_efficiency_score   ← 0-100 efficiency scores with grades
+├── violators                ← Meters exceeding 3000W + root cause hints
 ├── consumption_riyadh       ← Riyadh-specific consumption analysis
 ├── violators_riyadh         ← Riyadh violators report
 └── riyadh_quarter_report    ← Summary report matching team format
@@ -740,7 +751,175 @@ Some meters have current transformers (CTs) that scale down readings. The multip
 
 ---
 
-## 9. Violator Analysis
+## 9. Normal Consumption Pattern Analysis
+
+The pipeline includes advanced analytics models that establish baseline consumption patterns and enable sophisticated meter classification, trending, and efficiency scoring.
+
+### Key Findings from Analysis
+
+Based on analysis of 28,228 compliant meter-quarter records:
+
+| Metric | Morning Period | Evening Period |
+|--------|----------------|----------------|
+| **Median (P50)** | 764 W | 894 W |
+| **IQR Range** | 317 - 1,528 W | 408 - 1,701 W |
+| **Extended Range (P10-P90)** | 123 - 2,204 W | 184 - 2,382 W |
+
+Evening consumption is ~17% higher than morning, aligning with Isha prayer attendance patterns.
+
+### Analytics Models
+
+#### `consumption_benchmarks.sql`
+**Purpose**: Calculate percentile statistics for compliant (non-violator) meters.
+
+**Materialization**: `table`
+
+**Benchmark Levels**:
+| Level | Key | Description |
+|-------|-----|-------------|
+| `overall` | `all` | All compliant meters combined |
+| `regional` | Region name | Per-region benchmarks |
+| `quarterly` | Quarter (YYYY-QN) | Seasonal patterns |
+| `size_based` | Multiplication factor | Size-based patterns |
+
+**Key Metrics** (per period: morning/evening/total):
+- `p10, p25, p50, p75, p90, p95, p99` - Percentiles
+- `avg, stddev, min, max` - Standard statistics
+- `iqr` - Interquartile range (P75 - P25)
+
+---
+
+#### `meter_classification.sql`
+**Purpose**: Assign 6-tier classification to each meter based on benchmark percentiles.
+
+**Materialization**: `table`
+
+**Classification Tiers**:
+| Tier | Range | Description |
+|------|-------|-------------|
+| `EFFICIENT` | ≤ P25 | Exemplary low consumption |
+| `NORMAL_LOW` | P25 - P50 | Below median |
+| `NORMAL_HIGH` | P50 - P75 | Above median but acceptable |
+| `ELEVATED` | P75 - P90 | Warning zone |
+| `HIGH` | P90 - 3000W | Approaching threshold |
+| `VIOLATOR` | > 3000W | Exceeds threshold |
+
+**Key Columns**:
+- `morning_tier`, `evening_tier`, `overall_tier` - Classification per period
+- `tier_rank` - Numeric rank (1=best, 6=worst)
+- `is_violator`, `needs_attention` - Boolean flags
+
+---
+
+#### `meter_percentile_rank.sql`
+**Purpose**: Show where each meter stands relative to all others.
+
+**Materialization**: `table`
+
+**Key Columns**:
+- `morning_percentile`, `evening_percentile`, `total_percentile` - Percentile (0-100)
+- `regional_percentile` - Rank within region
+- `morning_diff_from_median`, `evening_diff_from_median` - Watts above/below median
+- `consumption_position` - Human-readable description (e.g., "Top 10% Most Efficient")
+
+**Example**: A meter at the 73rd percentile "consumes more than 73% of mosques."
+
+---
+
+#### `meter_consumption_trend.sql`
+**Purpose**: Track quarter-over-quarter consumption changes and detect anomalies.
+
+**Materialization**: `table`
+
+**Trend Categories**:
+| Trend | Criteria | Description |
+|-------|----------|-------------|
+| `FIRST_QUARTER` | No previous data | Initial observation |
+| `SPIKE` | >50% increase | Sudden rise |
+| `INCREASING` | 10-50% increase | Gradual rise |
+| `STABLE` | -10% to +10% | Normal variation |
+| `DECREASING` | 10-50% decrease | Gradual decline |
+| `DROP` | >50% decrease | Sudden fall |
+
+**Key Columns**:
+- `morning_pct_change`, `evening_pct_change`, `total_pct_change` - % change from previous quarter
+- `overall_trend` - Trend category
+- `has_spike`, `has_drop` - Boolean flags for alerts
+- `change_hint` - Possible cause (e.g., `SEASONAL_COOLING_LIKELY`)
+
+---
+
+#### `meter_efficiency_score.sql`
+**Purpose**: Composite efficiency score (0-100) for each meter.
+
+**Materialization**: `table`
+
+**Scoring**: Score = 100 × (1 - percentile_rank)
+- Score 100 = Most efficient (lowest consumption)
+- Score 0 = Least efficient (highest consumption)
+
+**Efficiency Grades**:
+| Grade | Score Range |
+|-------|-------------|
+| A+ | ≥ 90 |
+| A | 80-89 |
+| B | 70-79 |
+| C | 60-69 |
+| D | 50-59 |
+| E | 25-49 |
+| F | < 25 |
+
+**Key Columns**:
+- `combined_efficiency_score` - Average of morning/evening scores
+- `efficiency_grade` - Letter grade
+- `is_efficient`, `is_inefficient` - Boolean flags (top/bottom 25%)
+- `estimated_monthly_savings_if_at_median_sar` - Potential savings
+
+### Model Dependency Chain
+
+```
+consumption_analysis ──┬─► consumption_benchmarks ──┬─► meter_classification
+                       │                            ├─► meter_percentile_rank
+                       │                            ├─► meter_efficiency_score
+int_meter_quality ─────┤                            └─► violators (enhanced)
+                       │
+                       └─► meter_consumption_trend
+```
+
+### Running the Analytics Models
+
+```bash
+# Run all analytics models
+dbt run --select consumption_benchmarks+ --project-dir ./dags/dbt --profiles-dir ./include --target dev
+
+# Run specific model
+dbt run --select meter_efficiency_score --project-dir ./dags/dbt --profiles-dir ./include --target dev
+```
+
+### Example Queries
+
+```sql
+-- Find most efficient mosques
+SELECT meter_id, combined_efficiency_score, efficiency_grade
+FROM `raw_meter_readings.meter_efficiency_score`
+WHERE efficiency_grade IN ('A+', 'A')
+ORDER BY combined_efficiency_score DESC;
+
+-- Find meters with consumption spikes
+SELECT meter_id, quarter, total_pct_change, change_hint
+FROM `raw_meter_readings.meter_consumption_trend`
+WHERE has_spike = TRUE;
+
+-- Regional benchmarks
+SELECT benchmark_key as region, morning_p50, evening_p50, meter_count
+FROM `raw_meter_readings.consumption_benchmarks`
+WHERE benchmark_level = 'regional'
+ORDER BY meter_count DESC;
+```
+
+---
+
+## 10. Violator Analysis
 
 The pipeline includes specialized models for identifying and analyzing "violator" meters - those that consume excessive energy during prayer periods when mosques should be minimally occupied.
 
@@ -766,14 +945,37 @@ Only meters with **good data quality** (>50% quality score) are included in viol
 | `EVENING_ONLY` | Exceeds threshold only in evening period |
 | `COMPLIANT` | Below threshold in both periods |
 
+### Root Cause Analysis (NEW)
+
+The violators model now includes probable cause hints to help prioritize interventions:
+
+| Probable Cause | Criteria | Recommended Action |
+|----------------|----------|-------------------|
+| `LARGE_FACILITY_HIGH_LOAD` | MF > 10, low raw consumption | Verify meter configuration |
+| `OVERNIGHT_USAGE` | Evening >> Morning (3x) | Check HVAC/lighting schedules |
+| `CONTINUOUS_OVERCONSUMPTION` | Both periods > 5000W | Full facility audit |
+| `SEASONAL_COOLING` | Q2/Q3 in hot regions | Install timers on AC |
+| `DAYTIME_OVERCONSUMPTION` | Morning only | Check daytime equipment |
+| `EVENING_OVERCONSUMPTION` | Evening only | Check overnight lighting |
+| `INVESTIGATION_NEEDED` | No clear pattern | Manual investigation |
+
 ### Potential Savings Calculation
 
-The pipeline calculates potential cost savings if over-consumers reduced consumption to a normal level (500W):
+**New Benchmark-Based Calculation**: Uses the P50 (median) from `consumption_benchmarks` instead of a fixed 500W baseline for more accurate savings estimates.
 
 ```sql
--- Potential savings formula
-savings_sar = ((avg_consumption - 500) * reading_count / 2 / 1000) * 0.32
+-- New benchmark-based formula (more accurate)
+savings_sar = ((avg_consumption - benchmark_p50_median) * reading_count / 2 / 1000) * 0.32
+
+-- Legacy formula (fixed 500W baseline, kept for comparison)
+legacy_savings_sar = ((avg_consumption - 500) * reading_count / 2 / 1000) * 0.32
 ```
+
+**New Columns in violators table**:
+- `probable_cause` - Root cause hint for prioritization
+- `benchmark_morning_median`, `benchmark_evening_median` - Reference values
+- `total_potential_savings_sar` - Benchmark-based savings
+- `legacy_potential_savings_sar` - Fixed baseline savings (for comparison)
 
 ### Riyadh Reports
 
@@ -799,7 +1001,7 @@ LIMIT 20;
 
 ---
 
-## 10. Pipeline Statistics
+## 11. Pipeline Statistics
 
 The pipeline tracks detailed statistics at each processing stage for monitoring, debugging, and auditing.
 
@@ -876,7 +1078,7 @@ ORDER BY run_date DESC;
 
 ---
 
-## 11. Data Quality & Metrics
+## 12. Data Quality & Metrics
 
 After running the full pipeline, expect:
 
@@ -893,7 +1095,7 @@ After running the full pipeline, expect:
 
 ---
 
-## 12. Troubleshooting
+## 13. Troubleshooting
 
 ### dbt Seed Issues
 
@@ -935,7 +1137,7 @@ If seeing consumption > 100kW:
 
 ---
 
-## 13. Development Commands
+## 14. Development Commands
 
 ### Local dbt Development (without Airflow):
 
@@ -985,10 +1187,14 @@ ORDER BY total_energy_kwh DESC;
 
 ---
 
-## 14. Project Structure
+## 15. Project Structure
 
 ```
 .
+├── analysis/                      # Analysis scripts and reports
+│   ├── normal_consumption_report.md   # Normal pattern analysis report
+│   ├── normal_patterns_analysis.py    # Python analysis script
+│   └── normal_patterns_queries.sql    # SQL queries for BigQuery
 ├── dags/
 │   ├── dbt/
 │   │   ├── models/
@@ -1004,7 +1210,12 @@ ORDER BY total_energy_kwh DESC;
 │   │   │       ├── int_meter_quality.sql      # Data quality scoring
 │   │   │       ├── int_meter_readings_with_periods.sql
 │   │   │       ├── consumption_analysis.sql   # Main consumption metrics
-│   │   │       ├── violators.sql              # Over-consumer detection
+│   │   │       ├── consumption_benchmarks.sql # Percentile statistics (NEW)
+│   │   │       ├── meter_classification.sql   # 6-tier classification (NEW)
+│   │   │       ├── meter_percentile_rank.sql  # Per-meter ranking (NEW)
+│   │   │       ├── meter_consumption_trend.sql # Q-o-Q trends (NEW)
+│   │   │       ├── meter_efficiency_score.sql # Efficiency scores (NEW)
+│   │   │       ├── violators.sql              # Over-consumers + root cause
 │   │   │       ├── consumption_riyadh.sql     # Riyadh regional analysis
 │   │   │       ├── violators_riyadh.sql       # Riyadh violators report
 │   │   │       ├── riyadh_quarter_report.sql  # Summary report
@@ -1015,6 +1226,12 @@ ORDER BY total_energy_kwh DESC;
 │   │   ├── sources.yml            # Source table definitions
 │   │   └── dbt_project.yml
 │   └── dbt_pipeline.py            # Airflow DAG (with file sensor)
+├── docs/
+│   └── stages/                    # ML lifecycle documentation
+│       ├── 01_planning.md
+│       ├── 02_data_preparation.md
+│       ├── ...
+│       └── images/                # Generated figures
 ├── include/
 │   ├── etl_processor.py           # CSV → Parquet ETL
 │   ├── cloud_loader.py            # Parquet → BigQuery
@@ -1031,7 +1248,7 @@ ORDER BY total_energy_kwh DESC;
 
 ---
 
-## 15. Next Steps
+## 16. Next Steps
 
 After completing the setup:
 
@@ -1044,7 +1261,7 @@ After completing the setup:
 
 ---
 
-## 16. Contributing
+## 17. Contributing
 
 When making changes:
 1. Update this README if adding new models or changing the pipeline

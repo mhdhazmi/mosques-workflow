@@ -25,6 +25,8 @@ vars:
   baseline_consumption_watts: 500
   # Minimum data quality percentage to include meter in analysis
   quality_threshold_pct: 50
+  # Friday/weekday Dhuhr consumption ratio threshold to classify as Juma mosque
+  juma_ratio_threshold: 1.5
 
 models:
   my_energy_project:

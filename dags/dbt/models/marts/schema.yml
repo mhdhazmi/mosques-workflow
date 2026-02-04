@@ -155,3 +155,33 @@ models:
         description: "Potential savings using benchmark-based calculation (SAR)"
       - name: legacy_potential_savings_sar
         description: "Potential savings using fixed baseline calculation (SAR)"
+
+  - name: juma_classification
+    description: "Classifies mosques as Juma (Friday prayer) or regular based on Dhuhr consumption patterns"
+    columns:
+      - name: meter_id
+        description: "Unique identifier for the smart meter"
+        tests:
+          - not_null
+      - name: quarter
+        description: "Quarter identifier (YYYY-QN format)"
+      - name: friday_dhuhr_avg
+        description: "Average consumption during Friday Dhuhr period (watts)"
+      - name: weekday_dhuhr_avg
+        description: "Average consumption during weekday Dhuhr period (watts)"
+      - name: friday_weekday_ratio
+        description: "Ratio of Friday to weekday Dhuhr consumption (higher = more Friday activity)"
+      - name: friday_reading_count
+        description: "Number of Friday Dhuhr readings in the quarter"
+      - name: weekday_reading_count
+        description: "Number of weekday Dhuhr readings in the quarter"
+      - name: multiplication_factor
+        description: "Meter size/capacity factor from industry codes"
+      - name: has_sufficient_data
+        description: "Boolean flag if meter has enough readings for reliable classification"
+      - name: is_juma
+        description: "Boolean flag indicating if mosque is classified as Juma (Friday prayer mosque)"
+      - name: juma_confidence
+        description: "Confidence level of classification: HIGH, MEDIUM, LOW, INSUFFICIENT_DATA, NO_BASELINE"
+      - name: classification_reason
+        description: "Human-readable explanation for the classification decision"

@@ -12,9 +12,10 @@ This guide provides a complete end-to-end walkthrough for setting up, configurin
 - [Pipeline Architecture](#7-pipeline-architecture--data-flow)
 - [dbt Models Documentation](#8-dbt-models-documentation)
 - [Normal Consumption Pattern Analysis](#9-normal-consumption-pattern-analysis)
-- [Violator Analysis](#10-violator-analysis)
-- [Pipeline Statistics](#11-pipeline-statistics)
-- [Troubleshooting](#12-troubleshooting)
+- [Juma Mosque Classification](#10-juma-mosque-classification)
+- [Violator Analysis](#11-violator-analysis)
+- [Pipeline Statistics](#12-pipeline-statistics)
+- [Troubleshooting](#13-troubleshooting)
 
 ---
 
@@ -265,6 +266,7 @@ Seeds are CSV files in `dags/dbt/seeds/` that contain static reference data. The
 │  - consumption_analysis (consumption metrics, incr.)    │
 │  - consumption_benchmarks (percentile statistics)       │
 │  - meter_classification (6-tier classification)         │
+│  - juma_classification (Juma vs regular mosque)         │
 │  - meter_percentile_rank (per-meter ranking)           │
 │  - meter_consumption_trend (Q-o-Q trends)              │
 │  - meter_efficiency_score (0-100 efficiency scores)    │
@@ -355,6 +357,7 @@ Marts Layer
 ├── consumption_analysis     ← Final aggregated metrics (incremental)
 ├── consumption_benchmarks   ← Percentile statistics for normal meters
 ├── meter_classification     ← 6-tier classification (EFFICIENT → VIOLATOR)
+├── juma_classification      ← Juma (Friday prayer) vs regular mosque classification
 ├── meter_percentile_rank    ← Per-meter percentile ranking
 ├── meter_consumption_trend  ← Quarter-over-quarter trend analysis
 ├── meter_efficiency_score   ← 0-100 efficiency scores with grades
@@ -919,7 +922,116 @@ ORDER BY meter_count DESC;
 
 ---
 
-## 10. Violator Analysis
+## 10. Juma Mosque Classification
+
+The pipeline includes a classification model that identifies **Juma mosques** (large mosques that hold Friday congregational prayers) based on consumption patterns during the Dhuhr (noon) prayer period.
+
+### What is a Juma Mosque?
+
+Juma mosques are larger mosques that host the weekly Friday congregational prayer (Salat al-Jumu'ah). These mosques typically show:
+- **Higher Friday noon consumption** due to larger congregations
+- **Larger facility size** (higher multiplication factor)
+- **Distinct consumption spike** during Friday Dhuhr period vs. weekday Dhuhr
+
+### Classification Logic
+
+The model uses two signals to classify mosques:
+
+| Signal | Weight | Description |
+|--------|--------|-------------|
+| **Friday Dhuhr Spike** | Primary | Ratio of Friday Dhuhr consumption to weekday Dhuhr consumption |
+| **Multiplication Factor** | Secondary | Meter size/capacity as proxy for facility size |
+
+**Classification Rules**:
+1. If `friday_weekday_ratio >= 1.5` (configurable) → Classified as Juma
+2. If `multiplication_factor >= 100` AND `ratio >= 1.2` → Classified as Juma (large facility with moderate spike)
+3. Otherwise → Classified as Regular mosque
+
+### Configuration
+
+The classification threshold is configurable in `dags/dbt/dbt_project.yml`:
+
+```yaml
+vars:
+  juma_ratio_threshold: 1.5  # Friday/weekday Dhuhr consumption ratio
+```
+
+### Data Quality Requirements
+
+Classifications are only made for meters with sufficient data:
+- At least **4 Friday Dhuhr readings** per quarter
+- At least **20 weekday Dhuhr readings** per quarter
+
+### Output Columns
+
+| Column | Type | Description |
+|--------|------|-------------|
+| meter_id | STRING | Meter identifier |
+| quarter | STRING | Quarter (YYYY-QN) |
+| friday_dhuhr_avg | FLOAT64 | Avg consumption during Friday Dhuhr (watts) |
+| weekday_dhuhr_avg | FLOAT64 | Avg consumption during weekday Dhuhr (watts) |
+| friday_weekday_ratio | FLOAT64 | Ratio of Friday to weekday consumption |
+| friday_reading_count | INT64 | Number of Friday Dhuhr readings |
+| weekday_reading_count | INT64 | Number of weekday Dhuhr readings |
+| multiplication_factor | FLOAT64 | Meter size factor |
+| has_sufficient_data | BOOLEAN | TRUE if enough readings for classification |
+| is_juma | BOOLEAN | TRUE if classified as Juma mosque |
+| juma_confidence | STRING | HIGH, MEDIUM, LOW, INSUFFICIENT_DATA, NO_BASELINE |
+| classification_reason | STRING | Human-readable explanation |
+
+### Confidence Levels
+
+| Confidence | Criteria |
+|------------|----------|
+| **HIGH** | Meets ratio threshold AND multiplication_factor >= 40 |
+| **MEDIUM** | Meets ratio threshold with smaller facility, OR large facility (MF >= 100) with moderate ratio |
+| **LOW** | Doesn't meet classification criteria |
+| **INSUFFICIENT_DATA** | Not enough readings for reliable classification |
+| **NO_BASELINE** | No weekday baseline available |
+
+### Example Queries
+
+```sql
+-- Find all Juma mosques with high confidence
+SELECT meter_id, friday_weekday_ratio, multiplication_factor, classification_reason
+FROM `raw_meter_readings.juma_classification`
+WHERE is_juma = TRUE AND juma_confidence = 'HIGH'
+ORDER BY friday_weekday_ratio DESC;
+
+-- Summary of Juma vs Regular mosques by region
+SELECT
+    region,
+    COUNTIF(is_juma) as juma_count,
+    COUNTIF(NOT is_juma AND has_sufficient_data) as regular_count,
+    ROUND(COUNTIF(is_juma) / COUNT(*) * 100, 1) as juma_percentage
+FROM `raw_meter_readings.juma_classification` j
+JOIN `raw_meter_readings.stg_industry_codes` i USING (meter_id)
+WHERE has_sufficient_data = TRUE
+GROUP BY region
+ORDER BY juma_count DESC;
+
+-- Compare consumption patterns: Juma vs Regular
+SELECT
+    is_juma,
+    COUNT(*) as meter_count,
+    ROUND(AVG(friday_dhuhr_avg), 0) as avg_friday_dhuhr_watts,
+    ROUND(AVG(weekday_dhuhr_avg), 0) as avg_weekday_dhuhr_watts,
+    ROUND(AVG(friday_weekday_ratio), 2) as avg_ratio
+FROM `raw_meter_readings.juma_classification`
+WHERE has_sufficient_data = TRUE
+GROUP BY is_juma;
+```
+
+### Use Cases
+
+1. **Targeted Energy Audits**: Focus efficiency improvements on Juma mosques which have higher absolute consumption
+2. **Benchmark Comparison**: Compare Juma mosques against each other (not against smaller regular mosques)
+3. **Scheduling Optimization**: Different HVAC schedules for Juma vs regular mosques
+4. **Capacity Planning**: Identify mosques that may need electrical upgrades
+
+---
+
+## 11. Violator Analysis
 
 The pipeline includes specialized models for identifying and analyzing "violator" meters - those that consume excessive energy during prayer periods when mosques should be minimally occupied.
 
@@ -1001,7 +1113,7 @@ LIMIT 20;
 
 ---
 
-## 11. Pipeline Statistics
+## 12. Pipeline Statistics
 
 The pipeline tracks detailed statistics at each processing stage for monitoring, debugging, and auditing.
 
@@ -1078,7 +1190,7 @@ ORDER BY run_date DESC;
 
 ---
 
-## 12. Data Quality & Metrics
+## 13. Data Quality & Metrics
 
 After running the full pipeline, expect:
 
@@ -1095,7 +1207,7 @@ After running the full pipeline, expect:
 
 ---
 
-## 13. Troubleshooting
+## 14. Troubleshooting
 
 ### dbt Seed Issues
 
@@ -1137,7 +1249,7 @@ If seeing consumption > 100kW:
 
 ---
 
-## 14. Development Commands
+## 15. Development Commands
 
 ### Local dbt Development (without Airflow):
 
@@ -1187,7 +1299,7 @@ ORDER BY total_energy_kwh DESC;
 
 ---
 
-## 15. Project Structure
+## 16. Project Structure
 
 ```
 .
@@ -1212,6 +1324,7 @@ ORDER BY total_energy_kwh DESC;
 │   │   │       ├── consumption_analysis.sql   # Main consumption metrics
 │   │   │       ├── consumption_benchmarks.sql # Percentile statistics (NEW)
 │   │   │       ├── meter_classification.sql   # 6-tier classification (NEW)
+│   │   │       ├── juma_classification.sql    # Juma vs regular mosque (NEW)
 │   │   │       ├── meter_percentile_rank.sql  # Per-meter ranking (NEW)
 │   │   │       ├── meter_consumption_trend.sql # Q-o-Q trends (NEW)
 │   │   │       ├── meter_efficiency_score.sql # Efficiency scores (NEW)
@@ -1248,7 +1361,7 @@ ORDER BY total_energy_kwh DESC;
 
 ---
 
-## 16. Next Steps
+## 17. Next Steps
 
 After completing the setup:
 
@@ -1261,7 +1374,7 @@ After completing the setup:
 
 ---
 
-## 17. Contributing
+## 18. Contributing
 
 When making changes:
 1. Update this README if adding new models or changing the pipeline
